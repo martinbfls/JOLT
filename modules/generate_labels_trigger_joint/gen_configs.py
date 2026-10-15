@@ -9,7 +9,6 @@ import random
 from pathlib import Path
 
 import toml
-import torch
 
 from modules.base_utils.gen_configs import wandb_block
 from modules.base_utils.config_validation import (
