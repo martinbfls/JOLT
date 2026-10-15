@@ -105,7 +105,7 @@ BRANCH_FILE_SUFFIX["flip_single_user"] = BRANCH_FILE_SUFFIX["single_user"]
 
 # "centralized" is a synthetic series read from the single_user branch, not a real aggregator.
 CENTRALIZED_SERIES = "centralized"
-TABLE_AGG_ORDER = ["mean", "median", "krum", "trmean", "multikrum"]
+TABLE_AGG_ORDER = ["mean", "krum", "trmean", "multikrum"]
 TABLE_COLUMNS_WITH_CENTRALIZED = [CENTRALIZED_SERIES] + TABLE_AGG_ORDER
 TABLE_AGG_DISPLAY = {
     CENTRALIZED_SERIES: "CENTRALIZED",
@@ -118,9 +118,9 @@ TABLE_AGG_DISPLAY = {
 
 # Tag -> table block name.
 TAG_DISPLAY_NAMES = {
-    "baseline": "Optimized Trigger -- \\jolt{}",
-    "eps_0p50_lpips_0p1": "Optimized Trigger (eps=0.5, LPIPS=0.1) -- \\jolt{}",
-    "eps_16_255": "Optimized Trigger (eps=16/255) -- \\jolt{}",
+    "baseline": "Optimized Trigger ($\\varepsilon=1.0$) -- \\jolt{}",
+    "eps_0p50_lpips_0p1": "Optimized Trigger ($\\varepsilon=0.5$, LPIPS$=0.1$) -- \\jolt{}",
+    "eps_16_255": "Optimized Trigger ($\\varepsilon=16/255$) -- \\jolt{}",
 }
 
 # FLIP has no stealth-regularized variants, so it gets exactly one table block.
@@ -842,12 +842,13 @@ def build_table(blocks, budgets, series_labels, caption, label):
     lines = [
         "\\begin{table}[ht]",
         "\\centering",
-        "\\scriptsize",
-        "\\setlength{\\tabcolsep}{3pt}",
+        "% \\tiny",
+        "% \\setlength{\\tabcolsep}{1pt}",
         "",
         f"\\caption{{{caption}}}",
         "\\vspace{2mm}",
-        "\\begin{tabular}{c " + " ".join(["c"] * len(series_labels)) + "}",
+        "\\resizebox{\\linewidth}{!}{%",
+        "\\begin{tabular}{@{}" + " ".join(["c"] * (1 + len(series_labels))) + "@{}}",
         "\\toprule",
         "Budget & " + " & ".join(TABLE_AGG_DISPLAY.get(s, str(s).upper()) for s in series_labels) + " \\\\",
     ]
@@ -859,6 +860,7 @@ def build_table(blocks, budgets, series_labels, caption, label):
     lines += [
         "\\bottomrule",
         "\\end{tabular}",
+        "}",
         f"\\label{{{label}}}",
         "\\end{table}",
     ]

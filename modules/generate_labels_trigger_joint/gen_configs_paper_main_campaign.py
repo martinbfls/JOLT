@@ -59,7 +59,7 @@ num_honests = {deploy_num_honests}
 num_poisoned = {deploy_num_poisoned}
 agg_method = "{agg_method}"
 optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
-schedule_kwargs = {{milestones = {milestones}, gamma = 0.1}}
+scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
 """
 
 JOINT_TRIGGER_TEMPLATE = """[generate_labels_trigger_joint]
