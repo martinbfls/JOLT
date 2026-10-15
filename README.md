@@ -15,6 +15,7 @@ official code: https://github.com/LPD-EPFL/ByzantineMomentum).
 - `schemas/`: one `<module_name>.toml` per module, documenting every config key
 - `experiments/`: config trees and outputs for each experiment, one subdirectory per campaign
 - `scripts/`: campaign-independent utilities (results aggregation, plots)
+- `orchestrate_slurm/`, `orchestrate_student_machines/`: campaign launchers (Slurm cluster / SSH pool)
 - `tools/`, `modules/base_utils/aggregator/`: robust-aggregation rules (adapted, see above)
 
 ## Installation
@@ -57,6 +58,25 @@ python -m modules.generate_labels_trigger_joint.gen_configs_paper_main_campaign 
 python -m modules.generate_labels_trigger_joint.gen_configs_paper_main_campaign --dry-run      # validate without writing
 python -m modules.generate_labels_trigger_joint.gen_configs_paper_main_campaign
 ```
+
+### Launching a campaign
+
+Run from the repo root, after generating the configs. Every script supports `DRY_RUN=1`
+(prints the job list, submits nothing) and documents its env overrides in its header.
+
+- Slurm (`orchestrate_slurm/`, shared helpers in `slurm_lib.sh`: account, partitions, conda env):
+  ```bash
+  SLURM_ACCOUNT=<account> ./orchestrate_slurm/orchestrate_runs_trigger_joint_paper_main_campaign_slurm.sh
+  SLURM_ACCOUNT=<account> ./orchestrate_slurm/orchestrate_runs_trigger_joint_slurm.sh  # gen_configs.py validation run
+  ./orchestrate_slurm/kill_all_slurm.sh
+  ```
+- Student machines over SSH (`orchestrate_student_machines/`, repo on the shared NFS home): run
+  BOOTSTRAP/GEN on Slurm with `SKIP_USER=1`, rsync `experiments/`, then
+  ```bash
+  TAG=baseline ./orchestrate_student_machines/orchestrate_runs_paper_main_campaign_flips.sh
+  TAG=baseline ./orchestrate_student_machines/orchestrate_runs_paper_main_campaign_user.sh
+  ./orchestrate_student_machines/kill_all.sh
+  ```
 
 ## Results
 
