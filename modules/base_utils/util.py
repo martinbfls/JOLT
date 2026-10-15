@@ -15,6 +15,7 @@ import toml
 from collections import OrderedDict
 from modules.base_utils.aggregator.trmean import aggr_trmean
 from modules.base_utils.aggregator.multikrum import aggregate as aggr_multikrum
+from modules.base_utils import robust_agg
 from modules.base_utils.datasets import make_dataloader
 
 if torch.cuda.is_available():
@@ -313,8 +314,14 @@ def mini_train_multi(
     epoch_callback=None,
     track_poison_selection=False,
     track_grad_proximity=False,
+    pre_agg=None,
 ):
     device = get_module_device(model)
+    robust_agg.validate(agg_method, pre_agg)
+    # Full-gradient rules and pre-aggregation go through robust_agg.aggregate; the legacy
+    # per-layer loop below is kept untouched for everything else.
+    full_path = robust_agg.uses_full_path(agg_method, pre_agg)
+    tracked_selection = agg_method in ("multikrum", "krum", "krum_full", "multikrum_full")
 
     dataloaders = [
         either_dataloader_dataset_to_both(
@@ -419,9 +426,8 @@ def mini_train_multi(
                 if track_poison_selection:
                     step_selected_workers = set()
 
-                if track_grad_proximity or (
-                    track_poison_selection and agg_method in ("multikrum", "krum")
-                ):
+                legacy_selection = track_poison_selection and not full_path and agg_method in ("multikrum", "krum")
+                if track_grad_proximity or legacy_selection:
                     full_vectors = [
                         torch.cat([
                             grad_buffer[i][w].reshape(-1)
@@ -431,7 +437,7 @@ def mini_train_multi(
                         for w in range(len(batches))
                     ]
 
-                    if track_poison_selection and agg_method in ("multikrum", "krum"):
+                    if legacy_selection:
                         krum_m = 1 if agg_method == "krum" else None
                         _, step_selected_workers = aggr_multikrum(
                             full_vectors, f=f, m=krum_m, return_selected=True
@@ -450,8 +456,18 @@ def mini_train_multi(
                         epoch_l2_values.append(l2)
 
                 model.zero_grad()
+                if full_path:
+                    agg_grads, agg_selected = robust_agg.aggregate(
+                        grad_buffer, agg_method, f, pre_agg=pre_agg,
+                        track_selection=track_poison_selection and tracked_selection,
+                    )
+                    for p, g in zip(model.parameters(), agg_grads):
+                        if g is not None:
+                            p.grad = g
+                    if track_poison_selection and agg_selected is not None:
+                        step_selected_workers = set(agg_selected)
                 for i, p in enumerate(model.parameters()):
-                    if not grad_buffer[i]:
+                    if full_path or not grad_buffer[i]:
                         continue
 
                     grads = torch.stack(grad_buffer[i], dim=0)

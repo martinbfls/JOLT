@@ -28,6 +28,7 @@ from modules.base_utils.util import (
     mini_train,
 )
 from modules.base_utils.experiment_tracker import ExperimentTracker
+from modules.base_utils import robust_agg
 from modules.federated_generate_labels.utils import (
     coalesce_attack_config,
     extract_labels,
@@ -112,9 +113,11 @@ def run(experiment_name, module_name, **kwargs):
     else:
         gamma_stealth = 1.0
     agg_method = args.get("agg_method", "mean")
-    if agg_method != "mean":
+    pre_agg = args.get("pre_agg", None)
+    robust_agg.validate(agg_method, pre_agg)
+    if agg_method != "mean" or pre_agg not in (None, "none"):
         print(
-            f"WARNING: agg_method={agg_method!r} != 'mean' -- the P^mean objective assumes "
+            f"WARNING: agg_method={agg_method!r}, pre_agg={pre_agg!r} -- the P^mean objective assumes plain "
             "mean aggregation; a non-mean run confounds the aggregator with the attack factor."
         )
 
@@ -727,9 +730,9 @@ def run(experiment_name, module_name, **kwargs):
                     else:
                         L_gradmatch_k = torch.tensor(0.0, device=device)
 
-                    agg_student_grads = agg(student_params, student_grad_buf, agg_method, f=num_poisoned)
+                    agg_student_grads = agg(student_params, student_grad_buf, agg_method, f=num_poisoned, pre_agg=pre_agg)
 
-                    agg_expert_grads = agg(expert_params, expert_grad_buf, agg_method, f=num_poisoned)
+                    agg_expert_grads = agg(expert_params, expert_grad_buf, agg_method, f=num_poisoned, pre_agg=pre_agg)
 
                     if track_match and poison_grad_mean is not None:
                         L_match_k = grad_cosine_penalty(agg_expert_grads, poison_grad_mean)

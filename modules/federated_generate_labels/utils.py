@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from modules.base_utils.aggregator.trmean import aggr_trmean
 from modules.base_utils.aggregator.multikrum import aggregate as aggr_multikrum
+from modules.base_utils import robust_agg
 
 DEFAULT_ATTACK_ITERATIONS = 20
 DEFAULT_EXPERT_CONFIG = {
@@ -84,7 +85,12 @@ def coalesce_attack_config(attack_config):
     return {**DEFAULT_ATTACK_CONFIG, **attack_config}
 
 
-def agg(params, grad_buf, method, f=1, n=1):
+def agg(params, grad_buf, method, f=1, n=1, pre_agg=None):
+    if robust_agg.uses_full_path(method, pre_agg):
+        agg_grads, _ = robust_agg.aggregate(grad_buf, method, f, pre_agg=pre_agg)
+        for p, g in zip(params, agg_grads):
+            p.grad = g
+        return agg_grads
     agg_grads = []
     for i, p in enumerate(params):
         grads = torch.stack(grad_buf[i], dim=0)

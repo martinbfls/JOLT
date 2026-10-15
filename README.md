@@ -17,6 +17,7 @@ official code: https://github.com/LPD-EPFL/ByzantineMomentum).
 - `scripts/`: campaign-independent utilities (results aggregation, plots)
 - `orchestrate_slurm/`, `orchestrate_student_machines/`: campaign launchers (Slurm cluster / SSH pool)
 - `tools/`, `modules/base_utils/aggregator/`: robust-aggregation rules (adapted, see above)
+- `modules/base_utils/robust_agg.py`: full-gradient rules (`krum_full`, `multikrum_full`, `geomed`) and NNM pre-aggregation (`pre_agg = "nnm"`), usable as `agg_method`/`pre_agg` in `federated_train_user` and `generate_labels_trigger_joint` configs
 
 ## Installation
 

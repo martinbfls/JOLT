@@ -56,6 +56,7 @@ def run(experiment_name, module_name, **kwargs):
     output_dir = Path(slurmify_path(args["output_dir"], slurm_id))
     output_dir.mkdir(parents=True, exist_ok=True)
     agg_method = args.get("agg_method", "mean")
+    pre_agg = args.get("pre_agg", None)
     track_poison_selection = args.get("track_poison_selection", False)
     track_grad_proximity = args.get("track_grad_proximity", True)
 
@@ -140,6 +141,7 @@ def run(experiment_name, module_name, **kwargs):
         epochs=epochs,
         record=True,
         agg_method=agg_method,
+        pre_agg=pre_agg,
         f=num_poisoned,
         epoch_callback=tracker.epoch_callback(),
         track_poison_selection=track_poison_selection,
