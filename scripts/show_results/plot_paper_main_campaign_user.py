@@ -12,6 +12,8 @@ Usage:
   python scripts/show_results/plot_paper_main_campaign_user.py
   python scripts/show_results/plot_paper_main_campaign_user.py --model r32p \
       --tags baseline eps_16_255 --datasets cifar svhn
+  # + FLIP re-run with each JOLT trigger frozen (gen_configs_flip_frozen_trigger.py):
+  python scripts/show_results/plot_paper_main_campaign_user.py --flip-frozen-tags baseline eps_16_255
 """
 
 import argparse
@@ -44,6 +46,9 @@ from modules.generate_labels_trigger_joint.gen_configs_paper_main_campaign impor
     TARGET_LABEL,
     GEN_INIT,
     cell_name,
+)
+from modules.generate_labels_trigger_joint.gen_configs_flip_frozen_trigger import (
+    EXP_BASE as FLIP_FROZEN_EXP_BASE,
 )
 
 # =========================
@@ -123,6 +128,11 @@ TAG_DISPLAY_NAMES = {
     "eps_16_255": "Optimized Trigger ($\\varepsilon=16/255$) -- \\jolt{}",
 }
 
+# FLIP re-run with each tag's JOLT trigger frozen (gen_configs_flip_frozen_trigger.py).
+FLIP_FROZEN_TAG_DISPLAY_NAMES = {
+    tag: name.replace("-- \\jolt{}", "-- FLIP") for tag, name in TAG_DISPLAY_NAMES.items()
+}
+
 # FLIP has no stealth-regularized variants, so it gets exactly one table block.
 FLIP_BLOCK_NAME = f"Sinusoidal Trigger -- {FLIP_LABEL}"
 
@@ -133,7 +143,7 @@ MODEL_DISPLAY = {"r32p": "ResNet-32", "convnext_micro": "ConvNeXt-Micro"}
 # Multi-tag overlay style: plot_cta_vs_pta_per_branch overlays every requested JOLT tag plus
 # FLIP on the same per-aggregator figure, each getting its own shade of BRANCH_COLORS's hue.
 TAG_SHORT_DISPLAY = {
-    "baseline": f"{JOLT_LABEL} (\\epsilon$=1.0)",
+    "baseline": f"{JOLT_LABEL} ($\\epsilon$=1.0)",
     "eps_16_255": f"{JOLT_LABEL} ($\\epsilon$=16/255)",
     "eps_0p50_lpips_0p1": f"{JOLT_LABEL} ($\\epsilon$=0.5, LPIPS=0.1)",
 }
@@ -876,12 +886,14 @@ def build_dataset_table(
     include_centralized=True,
     exp_base=EXP_BASE,
     flip_root=None,
+    flip_frozen_tags=(),
+    flip_frozen_exp_base=FLIP_FROZEN_EXP_BASE,
 ):
-    """One table for (model_flag, dataset): one block per tag with data, plus an optional CENTRALIZED column and a FLIP block."""
+    """One table for (model_flag, dataset): one block per tag with data, plus an optional CENTRALIZED column and a FLIP block.
+    Each tag in `flip_frozen_tags` also gets, right after its JOLT block, a block for FLIP run with that tag's trigger frozen."""
     columns = TABLE_COLUMNS_WITH_CENTRALIZED if include_centralized else TABLE_AGG_ORDER
 
-    blocks = {}
-    for tag in tags:
+    def tag_block(tag, base):
         block = {}
         any_cell = False
         for series in columns:
@@ -893,7 +905,7 @@ def build_dataset_table(
                     "single_user",
                     budgets,
                     seeds,
-                    exp_base=exp_base,
+                    exp_base=base,
                 )
             else:
                 df = compute_cta_pta_mean_var(
@@ -904,7 +916,7 @@ def build_dataset_table(
                     budgets,
                     seeds,
                     agg=series,
-                    exp_base=exp_base,
+                    exp_base=base,
                 )
             for _, row in df.iterrows():
                 if not np.isnan(row["cta_mean"]):
@@ -915,10 +927,21 @@ def build_dataset_table(
                     row["pta_mean"],
                     row["pta_var"],
                 )
-        if any_cell:
+        return block if any_cell else None
+
+    blocks = {}
+    for tag in tags:
+        block = tag_block(tag, exp_base)
+        if block is not None:
             blocks[TAG_DISPLAY_NAMES.get(tag, tag)] = block
         else:
             print(f"[INFO] tag={tag!r} has no data yet for {model_flag}/{dataset} -- skipped in table.")
+        if tag in flip_frozen_tags:
+            block = tag_block(tag, flip_frozen_exp_base)
+            if block is not None:
+                blocks[FLIP_FROZEN_TAG_DISPLAY_NAMES.get(tag, f"{tag} -- FLIP")] = block
+            else:
+                print(f"[INFO] FLIP frozen-trigger tag={tag!r} has no data yet for {model_flag}/{dataset} -- skipped in table.")
 
     if flip_root:
         flip_block = {}
@@ -1080,6 +1103,18 @@ def main():
         "(e.g. /mnt/cluster/FLIP/out_iclr). "
         "Default: use EXP_BASE unchanged.",
     )
+    parser.add_argument(
+        "--flip-frozen-tags",
+        nargs="*",
+        default=[],
+        help="table tags that also get a block for FLIP re-run with that tag's JOLT trigger frozen "
+        "(gen_configs_flip_frozen_trigger.py), placed right after the tag's JOLT block",
+    )
+    parser.add_argument(
+        "--flip-frozen-root",
+        default=None,
+        help=f"override where the FLIP frozen-trigger results are read from (default: {FLIP_FROZEN_EXP_BASE})",
+    )
     parser.add_argument("--skip-trigger-visuals", action="store_true")
     parser.add_argument(
         "--no-centralized-column",
@@ -1091,6 +1126,7 @@ def main():
 
     table_tags = args.table_tags or args.tags
     exp_base = Path(args.jolt_root) if args.jolt_root else EXP_BASE
+    flip_frozen_exp_base = Path(args.flip_frozen_root) if args.flip_frozen_root else FLIP_FROZEN_EXP_BASE
 
     tags_suffix = "-".join(args.tags)
     out_root = Path(args.out_dir) / f"{args.model}_{tags_suffix}"
@@ -1186,6 +1222,8 @@ def main():
             include_centralized=not args.no_centralized_column,
             exp_base=exp_base,
             flip_root=args.flip_root or None,
+            flip_frozen_tags=args.flip_frozen_tags,
+            flip_frozen_exp_base=flip_frozen_exp_base,
         )
         if table is None:
             print(f"[WARNING] no data found for table blocks {table_tags} -- nothing written for {dataset}.")

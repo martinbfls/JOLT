@@ -230,6 +230,14 @@ def bootstrap_cell_name(model_flag, dataset, seed):
     return f"train_expert/{model_flag}_{dataset}_1xs/seed{seed}"
 
 
+def joint_trigger_path(model_flag, dataset, tag, seed, exp_base=EXP_BASE):
+    """The .pt trigger generate_labels_trigger_joint saves for this cell (read back by train_user)."""
+    return (
+        exp_base / cell_name(model_flag, dataset, tag, seed) / "gen_labels_trigger_joint" / "trigger"
+        / f"opt_trig_direct_joint_{GEN_INIT}_{model_flag}_{dataset}_{GEN_NUM_POISONED}vs{GEN_NUM_HONESTS}.pt"
+    )
+
+
 def _train_user_configs(
     *, base_dir, budgets, num_honests, num_poisoned, agg_methods, flips_dir, model_flag,
     dataset, trigger_path, lr, wd, milestones,
@@ -353,10 +361,7 @@ def generate_cell(model_flag, dataset, tag, overrides, seed, dry_run=False):
         ),
     }
 
-    trigger_path = (
-        module_dir / "trigger"
-        / f"opt_trig_direct_joint_{GEN_INIT}_{model_flag}_{dataset}_{GEN_NUM_POISONED}vs{GEN_NUM_HONESTS}.pt"
-    )
+    trigger_path = joint_trigger_path(model_flag, dataset, tag, seed)
 
     # -- single_user branch: 1-poisoned/0-honest/mean, same split as generation time. --
     single_user_flips_dir = cell_dir / "select_flips"

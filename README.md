@@ -60,6 +60,25 @@ python -m modules.generate_labels_trigger_joint.gen_configs_paper_main_campaign 
 python -m modules.generate_labels_trigger_joint.gen_configs_paper_main_campaign
 ```
 
+### FLIP with a frozen JOLT trigger
+
+Re-runs the FLIP pipeline (`train_expert -> generate_labels -> federated_select_flips ->
+federated_train_user`) with each paper-campaign cell's jointly optimized trigger held fixed, so
+JOLT can be compared with FLIP at equal trigger. Same `{model}/{dataset}/{tag}/seed{seed}/`
+layout, under `experiments/federated_experiments/flip_frozen_trigger_paper_main_campaign/`;
+needs the joint campaign's GEN phase (its triggers) first.
+
+```bash
+python -m modules.generate_labels_trigger_joint.gen_configs_flip_frozen_trigger                  # all cells
+python -m modules.generate_labels_trigger_joint.gen_configs_flip_frozen_trigger --models r32p --datasets cifar --tags baseline --seeds 0 1
+SLURM_ACCOUNT=<account> MODEL_FLAGS=r32p DATASETS=cifar STEALTH_TAGS=baseline SEEDS="0 1" \
+    ./orchestrate_slurm/orchestrate_runs_flip_frozen_trigger_slurm.sh
+python scripts/show_results/plot_paper_main_campaign_user.py --flip-frozen-tags baseline eps_16_255
+```
+
+The student-machine flips/user scripts run it with
+`EXP_BASE_REL=federated_experiments/flip_frozen_trigger_paper_main_campaign`.
+
 ### Launching a campaign
 
 Run from the repo root, after generating the configs. Every script supports `DRY_RUN=1`

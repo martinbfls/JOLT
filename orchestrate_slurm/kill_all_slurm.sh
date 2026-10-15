@@ -5,18 +5,18 @@
 # Slurm counterpart to kill_all.sh. Instead of SSH-ing into each machine to
 # pkill stray "python run_experiment.py" processes, it cancels the current
 # user's queued/running Slurm jobs whose job name matches a filter (default
-# "^(joint|paper)_", the job-name prefixes the campaign scripts use), via
+# "^(joint|paper|flipfz)_", the job-name prefixes the campaign scripts use), via
 # scancel. Scoped to $USER and a name filter rather than a blanket
 # cancellation, to avoid touching unrelated jobs on a shared cluster.
 #
 # Usage:
-#   ./kill_all_slurm.sh              # cancels joint_* / paper_* campaign jobs (incl. barriers)
+#   ./kill_all_slurm.sh              # cancels joint_* / paper_* / flipfz_* campaign jobs (incl. barriers)
 #   ./kill_all_slurm.sh my_job_name  # cancels jobs matching a custom filter
 ###
 
 set -u
 
-FILTER="${1:-^(joint|paper)_}"
+FILTER="${1:-^(joint|paper|flipfz)_}"
 
 echo "Looking up Slurm jobs for user '$USER' matching name filter '$FILTER'..."
 

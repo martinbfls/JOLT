@@ -23,6 +23,7 @@
 #
 # Usage:
 #   TAG=baseline ./orchestrate_runs_paper_main_campaign_user.sh
+#   EXP_BASE_REL=federated_experiments/flip_frozen_trigger_paper_main_campaign TAG=baseline ./orchestrate_runs_paper_main_campaign_user.sh
 #   TAG=eps_16_255 ./orchestrate_runs_paper_main_campaign_user.sh   # once that tag's GEN/FLIPS land
 #
 # FORCE_RETRAIN=1: bypass the already_done (caccs.npy/paccs.npy present) skip check, so every
@@ -47,7 +48,8 @@ BASE_DIR="${BASE_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 LOG_DIR="$BASE_DIR/logs_paper_user"
 mkdir -p "$LOG_DIR"
 
-EXP_BASE_REL="federated_experiments/threat_model_direct_trigger_joint_paper_main_campaign"
+# Same layout for the FLIP frozen-trigger campaign: EXP_BASE_REL=federated_experiments/flip_frozen_trigger_paper_main_campaign
+EXP_BASE_REL="${EXP_BASE_REL:-federated_experiments/threat_model_direct_trigger_joint_paper_main_campaign}"
 
 TAG="${TAG:-baseline}"
 MODEL_FLAGS=("r32p" "convnext_micro")
