@@ -114,6 +114,17 @@ are skipped (regenerable in minutes from the gen labels; `--keep-workers` to kee
 `show_results.py`: aggregate CTA/ASR across seeds and produce the paper's main-campaign
 tables/figures.
 
+### Per-seed results
+
+`scripts/show_results/plot_asr_per_seed.py` plots ASR (or `--metric cta`) vs budget with one line
+per seed for every aggregator, plus a seed x budget heatmap and a long-format CSV of every cell,
+to inspect the across-seed variance (e.g. the nonzero ASR at budget 0):
+
+```bash
+python scripts/show_results/plot_asr_per_seed.py --tags baseline eps_16_255
+python scripts/show_results/plot_asr_per_seed.py --campaign flip_frozen
+```
+
 ### Training / generation curves
 
 Every module records its metrics with `ExperimentTracker`: `experiments/<run>/logs/<module>_metrics.json`
