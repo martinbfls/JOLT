@@ -98,6 +98,16 @@ Run from the repo root, after generating the configs. Every script supports `DRY
   ./orchestrate_student_machines/kill_all.sh
   ```
 
+## Backing up results
+
+`make backup` uploads `experiments/` to a private Hugging Face dataset (`<hf user>/jolt-results`,
+override with `HF_REPO=user/name`), incrementally and resumably; `make restore` downloads it back.
+Run it from a node with internet access, after `pip install huggingface_hub` and `hf auth login`
+(write token). `make backup-dry` shows what would be uploaded; `make backup BACKUP_ARGS=--checkpoints`
+also backs up `out/checkpoints/` to `<hf user>/jolt-checkpoints`. select_flips' `worker*/` files
+are skipped (regenerable in minutes from the gen labels; `--keep-workers` to keep them). See
+`scripts/backup_results.py`.
+
 ## Results
 
 `scripts/show_results/plot_paper_main_campaign_user.py`, `plot_trigger_grid.py`,

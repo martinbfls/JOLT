@@ -11,3 +11,4 @@ Pillow
 matplotlib
 wandb
 lpips
+huggingface_hub
