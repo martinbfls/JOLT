@@ -1,0 +1,4 @@
+[submodule "modules/pytorch_cifar"]
+	path = modules/pytorch_cifar
+	url = https://github.com/kuangliu/pytorch-cifar
+	ignore = all

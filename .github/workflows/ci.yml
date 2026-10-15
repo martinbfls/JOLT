@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      # Non-blocking for now: this codebase had never been linted before, so the baseline
+      # has known findings (see pyproject.toml). Widen `select` there and drop
+      # continue-on-error once the baseline is clean.
+      - name: ruff check
+        continue-on-error: true
+        run: uv tool run ruff check .
+
+  gen-configs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install toml
+      # Regenerate every campaign's configs into a throwaway experiments/ tree (gitignored,
+      # never committed) -- catches template/schema drift at generation time instead of a
+      # KeyError deep into a real cluster run (gen_configs.py schema-validates as it writes).
+      - name: Generate every campaign's configs
+        run: |
+          python -m modules.generate_labels_trigger_joint.gen_configs
+          python -m modules.generate_labels_trigger_joint.gen_configs_paper_main_campaign

@@ -1,0 +1,32 @@
+###
+# federated_train_user schema
+# Trains and records metrics on a downstream model trained on input labels.
+# Outputs the poison accuracy, clean accuracy, and training labels .npy files and a final model .pth.
+###
+
+[federated_train_user]
+input_labels = "string. Path to input labels .npy files (slurm compatible)."
+output_dir = "string. Path to output directory (slurm compatible)."
+user_model = "string: {r32p, r18, r18_tin, vgg, vgg_pretrain, vit_pretrain}. For ResNets, VGG-19s, and ViTs."
+dataset = "string: {cifar, cifar_100, tiny_imagenet}. For CIFAR-10, CIFAR-100 and Tiny Imagenet datasets."
+trainer = "string: {sgd, adam}. Specifies optimizer."
+source_label = "int: {0,1,...,9}. Specifies label to mimic."
+target_label = "int: {0,1,...,9}. Specifies label to attack."
+poisoner = "string: Form: {{1,2,3,9}xp, {1,2}xs, {1,4}xl}. Integer resembles number of attacks and string represents type."
+
+[OPTIONAL]
+true_labels = "string. Path to input labels .npy files (slurm compatible)."
+soft = "bool. Specifies whether to compute on logit or hard labels."
+alpha = "float: [0, 1]. Specifies interpolation parameter between true (1) and input (0) labels. Set to 0 (full input) if omitted."
+batch_size = "int: {0,1,...,infty}. Specifies batch size. Set to default for trainer if omitted."
+epochs = "int: {0,1,...,infty}. Specifies number of epochs. Set to default for trainer if omitted."
+optim_kwargs = "dict. Optional keywords for Pytorch SGD / Adam optimizer. See sever example."
+schedule_kwargs = "dict. Optional keywords for Pytorch learning rate optimizer (with SGD). See sever example."
+num_honests = "int: {0,1,...,infty}. Num of honests workers"
+num_poisoned = "int: {0,1,...,infty}. Num of poisoned workers"
+budget = "int: {0,1,...,infty}. Flip budget"
+agg_method = "str: aggregation method"
+delta = "str. path to optimized trigger"
+track_poison_selection = "bool. If true, tags each worker's examples with whether their label was flipped (via {budget}_idx_flipped.npy from federated_select_flips) and records, per aggregation step with agg_method in {multikrum, krum}, whether a poisoned worker's flipped-label gradient was selected. Written to output_dir/multikrum_poison_stats.json. Default: false."
+track_grad_proximity = "bool. Requires num_honests > 0 (skipped on single_user, num_honests=0 -- no honest worker to compare against). Independent of track_poison_selection, works for every agg_method. Per aggregation step, computes each worker's full-model gradient, averages it across honest vs. poisoned (last num_poisoned) workers, and measures cosine similarity / L2 distance between the two means. Per-epoch means append to output_dir/multikrum_poison_stats.json under 'grad_proximity' and log via ExperimentTracker as 'grad_cosine_sim_poisoned_honest' / 'grad_l2_dist_poisoned_honest' (auto-plotted). Default: true."
+wandb = "dict: {enabled: bool, project: str, entity: str (optional), mode: str {online, offline, disabled} (optional, default online), tags: list[str] (optional), group: str (optional), run_name: str (optional)}. If enabled=true, per-step metrics and the auto-generated loss-curve plots are also mirrored to Weights & Biases via modules/base_utils/experiment_tracker.py's ExperimentTracker. Absent or enabled=false (default): no W&B activity; local plots/metrics under experiments/<experiment_name>/{plots,logs}/<module_name>/ are produced either way."
