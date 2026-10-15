@@ -852,11 +852,9 @@ def build_table(blocks, budgets, series_labels, caption, label):
         "Budget & " + " & ".join(TABLE_AGG_DISPLAY.get(s, str(s).upper()) for s in series_labels) + " \\\\",
     ]
 
-    first = True
     for name, block in blocks.items():
         lines.append("\\midrule")
         lines.append(render_block(name, block, budgets, series_labels))
-        first = False
 
     lines += [
         "\\bottomrule",

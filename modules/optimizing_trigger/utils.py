@@ -16,7 +16,6 @@ from modules.base_utils.util import needs_big_ims
 from PIL import Image
 from torchvision import transforms
 from torch.utils.data import Subset, ConcatDataset
-import numpy as np
 
 RAW_TRANSFORM_X = transforms.ToTensor()
 RAW_TRANSFORM_Y = lambda y: y
