@@ -270,9 +270,11 @@ def mini_train(
                 "loss": "%.4g" % (train_epoch_loss / n),
                 "lr": "%.3g" % lr,
             }
+            epoch_test_metrics = []
             if test_data:
                 for i, dataset in enumerate(test_data):
                     acc, loss = clf_eval(model, dataset)
+                    epoch_test_metrics.append((acc, loss))
                     pbar_postfix.update(
                         {
                             "acc" + str(i): "%.2f" % (acc * 100),
@@ -288,6 +290,7 @@ def mini_train(
                     train_epoch_loss / n,
                     train_epoch_correct / n,
                     lr,
+                    test_metrics=epoch_test_metrics,
                 )
 
     if record:
@@ -522,9 +525,11 @@ def mini_train_multi(
                 "lr": "%.3g" % lr,
             }
 
+            epoch_test_metrics = []
             if test_data:
                 for i, dataset in enumerate(test_data):
                     acc, loss = clf_eval(model, dataset)
+                    epoch_test_metrics.append((acc, loss))
                     postfix[f"acc{i}"] = "%.2f" % (acc * 100)
                     if record:
                         acc_loss[i].append((acc, loss))
@@ -545,6 +550,7 @@ def mini_train_multi(
                     train_epoch_loss / total_samples,
                     train_epoch_correct / total_samples,
                     lr,
+                    test_metrics=epoch_test_metrics,
                 )
 
     if track_poison_selection or track_grad_proximity:

@@ -22,6 +22,7 @@ from modules.base_utils.util import (
     needs_big_ims,
     slurmify_path,
     clf_loss,
+    clf_eval,
     softmax,
     total_mse_distance,
     get_train_info,
@@ -78,7 +79,18 @@ def run(experiment_name, module_name, **kwargs):
     slurm_id = kwargs.get("slurm_id", None)
 
     args = extract_toml(experiment_name, module_name)
-    tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id)
+    # metrics_log_path is this module's own per-step history file (written at the end); the
+    # tracker's JSON goes to logs/ instead of overwriting it.
+    tracker = ExperimentTracker(
+        experiment_name, module_name, args, slurm_id=slurm_id,
+        x_label="Optimization step", use_config_metrics_path=False,
+    )
+    tracker.add_plot_group("asr_all", ["expert_asr", "expert_asr_frozen", "retrain_expert_asr"], ylabel="ASR (%)")
+    tracker.add_plot_group("losses", ["matching_term", "L_bd_mean", "L_joint_mean", "L_lpips_mean"], ylabel="Loss")
+    tracker.add_plot_group("trigger_norm", ["delta_l2", "delta_linf"], ylabel="Trigger norm")
+    tracker.add_plot_group(
+        "trigger_alignment", ["cos_target", "cos_source", "cos_delta_to_init"], ylabel="Cosine similarity",
+    )
 
     input_pths = args["input_pths"]
     opt_pths = args["opt_pths"]
@@ -423,7 +435,7 @@ def run(experiment_name, module_name, **kwargs):
             target_label,
             delta=delta_snapshot.detach().cpu(),
         )
-        poison_train, *_ = get_matching_datasets(
+        poison_train, _, test, poison_test, _ = get_matching_datasets(
             dataset_flag,
             poisoner,
             clean_label,
@@ -458,6 +470,11 @@ def run(experiment_name, module_name, **kwargs):
                 str(round_dir),
             ),
         )
+
+        retrain_cta = clf_eval(retrain_model, test)[0]
+        retrain_asr = clf_eval(retrain_model, poison_test.poison_dataset)[0]
+        print(f"[expert_retrain] round {round_idx}: retrained expert CTA={retrain_cta:.4f} ASR={retrain_asr:.4f}")
+        tracker.log(global_step, retrain_expert_cta=retrain_cta, retrain_expert_asr=retrain_asr)
 
         round_input_pths = str(retrain_base_dir / f"round{round_idx}" / "{}" / "model_{}_{}.pth")
         round_opt_pths = str(retrain_base_dir / f"round{round_idx}" / "{}" / "model_{}_{}_opt.pth")
@@ -930,65 +947,45 @@ def run(experiment_name, module_name, **kwargs):
                 mag_active_rate = sum(mag_active_window) / len(mag_active_window)
 
                 losses.append(grand_loss.item())
+                step_metrics = {
+                    "grand_loss": grand_loss.item(),
+                    "matching_term": matching_term,
+                    "L_bd_mean": L_bd_mean,
+                    "L_joint_mean": L_joint_mean,
+                    "L_lpips_mean": L_lpips_mean,
+                    "expert_asr": asr_mean,
+                    "expert_asr_frozen": asr_frozen_mean,
+                    "cos_delta_to_init": cos_to_init,
+                    "delta_drift_l2": delta_drift_l2,
+                    "delta_l2": delta_l2,
+                    "delta_linf": delta_linf,
+                    "cos_target": cos_target_post,
+                    "cos_source": cos_source_post,
+                    "L_align": L_align_post,
+                    "L_mag": L_mag_post,
+                    "align_active_rate": align_active_rate,
+                    "mag_active_rate": mag_active_rate,
+                    "reg_term": reg_term.item(),
+                    "mtt_delta_grad_norm": mtt_delta_grad_norm,
+                    "L_gradmatch": L_gradmatch_avg.item(),
+                    "L_match": L_match_avg.item(),
+                    "matching_term_std": float(np.std(matching_term_list)),
+                    "L_bd_mean_std": float(np.std(L_bd_mean_list)),
+                    "L_joint_mean_std": float(np.std(L_joint_mean_list)),
+                    "expert_asr_std": float(np.std(asr_mean_list)),
+                    "L_margin": margin_avg.item(),
+                    "margin_mean": float(np.mean(margin_raw_mean_list)),
+                    "L_consistency": consistency_avg.item(),
+                    "poison_consistency": consistency_avg.item(),
+                    "delta_sign_flip_rate": delta_sign_flip_rate,
+                    "lambda_bd_current": lambda_bd,
+                    "lambda_gradmatch_current": lambda_gradmatch,
+                    "lambda_lpips_current": lambda_lpips,
+                    "lambda_consistency_current": lambda_consistency,
+                }
                 if history is not None:
-                    history.append(
-                        {
-                            "it": it,
-                            "grand_loss": grand_loss.item(),
-                            "matching_term": matching_term,
-                            "L_bd_mean": L_bd_mean,
-                            "L_joint_mean": L_joint_mean,
-                            "L_lpips_mean": L_lpips_mean,
-                            "expert_asr": asr_mean,
-                            "expert_asr_frozen": asr_frozen_mean,
-                            "cos_delta_to_init": cos_to_init,
-                            "delta_drift_l2": delta_drift_l2,
-                            "delta_l2": delta_l2,
-                            "delta_linf": delta_linf,
-                            "cos_target": cos_target_post,
-                            "cos_source": cos_source_post,
-                            "L_align": L_align_post,
-                            "L_mag": L_mag_post,
-                            "align_active_rate": align_active_rate,
-                            "mag_active_rate": mag_active_rate,
-                            "reg_term": reg_term.item(),
-                            "mtt_delta_grad_norm": mtt_delta_grad_norm,
-                            "L_gradmatch": L_gradmatch_avg.item(),
-                            "L_match": L_match_avg.item(),
-                            "matching_term_std": float(np.std(matching_term_list)),
-                            "L_bd_mean_std": float(np.std(L_bd_mean_list)),
-                            "L_joint_mean_std": float(np.std(L_joint_mean_list)),
-                            "expert_asr_std": float(np.std(asr_mean_list)),
-                            "L_margin": margin_avg.item(),
-                            "margin_mean": float(np.mean(margin_raw_mean_list)),
-                            "L_consistency": consistency_avg.item(),
-                            "poison_consistency": consistency_avg.item(),
-                            "delta_sign_flip_rate": delta_sign_flip_rate,
-                            "lambda_bd_current": lambda_bd,
-                            "lambda_gradmatch_current": lambda_gradmatch,
-                            "lambda_lpips_current": lambda_lpips,
-                            "lambda_consistency_current": lambda_consistency,
-                        }
-                    )
-                tracker.log(
-                    it,
-                    grand_loss=grand_loss.item(),
-                    L_bd_mean=L_bd_mean,
-                    L_joint_mean=L_joint_mean,
-                    L_lpips_mean=L_lpips_mean,
-                    expert_asr=asr_mean,
-                    expert_asr_frozen=asr_frozen_mean,
-                    delta_l2=delta_l2,
-                    delta_linf=delta_linf,
-                    L_align=L_align_post,
-                    L_mag=L_mag_post,
-                    mtt_delta_grad_norm=mtt_delta_grad_norm,
-                    L_gradmatch=L_gradmatch_avg.item(),
-                    L_match=L_match_avg.item(),
-                    L_margin=margin_avg.item(),
-                    L_consistency=consistency_avg.item(),
-                    delta_sign_flip_rate=delta_sign_flip_rate,
-                )
+                    history.append({"it": it, **step_metrics})
+                tracker.log(global_step, **step_metrics)
 
                 pbar.update(batch_size)
                 pbar.set_postfix(

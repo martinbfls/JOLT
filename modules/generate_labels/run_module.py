@@ -30,7 +30,7 @@ def run(experiment_name, module_name, **kwargs):
     slurm_id = kwargs.get('slurm_id', None)
 
     args = extract_toml(experiment_name, module_name)
-    tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id)
+    tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id, x_label="Optimization step")
 
     input_pths = args["input_pths"]
     opt_pths = args["opt_pths"]
@@ -93,6 +93,7 @@ def run(experiment_name, module_name, **kwargs):
                                                           batch_size=batch_size)
 
     losses = []
+    global_step = 0
     with make_pbar(total=config['iterations'] * len(mtt_dataset)) as pbar:
         for i in range(config['iterations']):
             for x_t, y_t, x_d, y_true, idx in mtt_dataloader:
@@ -142,7 +143,8 @@ def run(experiment_name, module_name, **kwargs):
                 optimizer_labels.step()
 
                 losses.append(g_loss)
-                tracker.log(i, g_loss=g_loss)
+                global_step += 1
+                tracker.log(global_step, g_loss=g_loss)
                 pbar.update(batch_size)
                 pbar_postfix = {
                     'g_loss': "%.4g" % np.mean(losses[-20:]),

@@ -37,6 +37,8 @@ import warnings
 from pathlib import Path
 from typing import Callable, Optional
 
+import numpy as np
+
 
 def generate_full_path(path):
     """Mirrors modules.base_utils.util.generate_full_path, duplicated here so this module
@@ -52,17 +54,10 @@ def slurmify_path(path, slurm_id):
 
 
 try:
-    import matplotlib
-    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from modules.base_utils import plot_style
 
-    plt.rcParams.update({
-        "font.size": 13,
-        "axes.titlesize": 14,
-        "axes.labelsize": 13,
-        "legend.fontsize": 11,
-        "lines.linewidth": 2.5,
-    })
+    plot_style.apply()
     _HAS_MPL = True
 except Exception:
     _HAS_MPL = False
@@ -85,7 +80,12 @@ def compose_callbacks(*callbacks: Optional[Callable]) -> Optional[Callable]:
 
 
 class ExperimentTracker:
-    def __init__(self, experiment_name, module_name, args, slurm_id=None):
+    """`x_label` names the step axis of the plots ("Epoch", "Optimization step", ...).
+    `use_config_metrics_path=False` ignores the config's `metrics_log_path` (for modules that
+    write their own file there) and keeps the tracker's JSON under logs/."""
+
+    def __init__(self, experiment_name, module_name, args, slurm_id=None, x_label="Step",
+                 use_config_metrics_path=True):
         self.experiment_name = experiment_name
         self.module_name = module_name
         self.slurm_id = slurm_id
@@ -96,7 +96,9 @@ class ExperimentTracker:
 
         suffix = f"_{slurm_id}" if slurm_id is not None else ""
         default_metrics_path = self.run_dir / "logs" / f"{module_name}{suffix}_metrics.json"
-        metrics_log_path = args.get("metrics_log_path") if isinstance(args, dict) else None
+        metrics_log_path = (
+            args.get("metrics_log_path") if isinstance(args, dict) and use_config_metrics_path else None
+        )
         self.metrics_log_path = Path(
             slurmify_path(metrics_log_path, slurm_id) if metrics_log_path else default_metrics_path
         )
@@ -105,6 +107,8 @@ class ExperimentTracker:
 
         self._history: dict[str, list[tuple[int, float]]] = {}
         self._finalized = False
+        self.x_label = x_label
+        self._plot_groups = []
 
         self._wandb = None
         self._wandb_run = None
@@ -160,12 +164,23 @@ class ExperimentTracker:
                 warnings.warn(f"ExperimentTracker: wandb.log failed ({e}) -- disabling wandb.")
                 self._wandb = None
 
-    def epoch_callback(self):
-        """Returns a callback matching mini_train/mini_train_multi's `epoch_callback=` slot
-        (`fn(epoch, loss, acc, lr)`, called once per epoch -- cheap, no per-batch overhead)."""
+    def add_plot_group(self, name, keys, ylabel=None, title=None):
+        """Also plots `keys` together on one axis (written as `<name>.{png,pdf}`; `name` must not be
+        a metric key, whose own plot would share that file)."""
+        self._plot_groups.append((name, list(keys), ylabel, title))
 
-        def _callback(epoch, loss, acc, lr):
-            self.log(epoch, loss=loss, acc=acc, lr=lr)
+    def epoch_callback(self, test_names=("cta", "asr")):
+        """Returns a callback matching mini_train/mini_train_multi's `epoch_callback=` slot
+        (`fn(epoch, loss, acc, lr, test_metrics=None)`, called once per epoch -- cheap, no
+        per-batch overhead). `test_metrics` is the epoch's [(acc, loss), ...] over the
+        loop's test_data, logged as `test_names[i]` (accuracy) and `<name>_loss`."""
+
+        def _callback(epoch, loss, acc, lr, test_metrics=None):
+            metrics = {"loss": loss, "acc": acc, "lr": lr}
+            for name, (test_acc, test_loss) in zip(test_names, test_metrics or []):
+                metrics[name] = test_acc
+                metrics[f"{name}_loss"] = test_loss
+            self.log(epoch, **metrics)
 
         return _callback
 
@@ -178,48 +193,54 @@ class ExperimentTracker:
         with open(self.metrics_log_path, "w") as f:
             json.dump(serializable, f, indent=2)
 
+    def _series(self, key):
+        steps, values = zip(*self._history[key])
+        return np.asarray(steps), np.asarray(values, dtype=float) * plot_style.scale(key)
+
+    def _draw(self, ax, key, color, label=None):
+        steps, values = self._series(key)
+        window = plot_style.auto_window(len(values))
+        if window > 1:
+            ax.plot(steps, values, color=color, alpha=0.2, linewidth=1)
+            values = plot_style.smooth(values, window)
+        ax.plot(steps, values, color=color, label=label)
+
     def _write_plots(self):
         if not _HAS_MPL or not self._history:
             return []
-        self.plots_dir.mkdir(parents=True, exist_ok=True)
         written = []
+        title = f"{self.module_name}"
+        keys = [k for k, v in self._history.items() if v and len({val for _, val in v}) > 1]
 
-        for key, points in self._history.items():
-            if not points:
+        for key in keys:
+            fig, ax = plt.subplots(figsize=plot_style.SMALL_FIGSIZE)
+            self._draw(ax, key, plot_style.COLORS.get(key, "tab:blue"))
+            plot_style.style_axes(ax, self.x_label, plot_style.label(key), title)
+            written += plot_style.save(fig, self.plots_dir / key)
+
+        for name, group_keys, ylabel, group_title in self._plot_groups:
+            present = [k for k in group_keys if self._history.get(k)]
+            if not present:
                 continue
-            steps, values = zip(*points)
-            fig, ax = plt.subplots(figsize=(6, 4))
-            ax.plot(steps, values, color="tab:blue")
-            ax.set_xlabel("step")
-            ax.set_ylabel(key)
-            ax.set_title(f"{self.module_name}: {key}")
-            fig.tight_layout()
-            path = self.plots_dir / f"{key}.png"
-            fig.savefig(path, dpi=150)
-            plt.close(fig)
-            written.append(path)
+            fig, ax = plt.subplots(figsize=plot_style.FIGSIZE)
+            for i, key in enumerate(present):
+                self._draw(ax, key, plot_style.COLORS.get(key, f"C{i}"), label=plot_style.legend_label(key))
+            plot_style.style_axes(ax, self.x_label, ylabel or plot_style.label(present[0]), group_title or title)
+            ax.legend(frameon=True, fontsize=10, loc="best")
+            written += plot_style.save(fig, self.plots_dir / name)
 
-        keys = [k for k, v in self._history.items() if v]
         if keys:
-            n = len(keys)
-            ncols = min(3, n)
-            nrows = (n + ncols - 1) // ncols
+            ncols = min(3, len(keys))
+            nrows = (len(keys) + ncols - 1) // ncols
             fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.5 * nrows), squeeze=False)
             for i, key in enumerate(keys):
                 ax = axes[i // ncols][i % ncols]
-                steps, values = zip(*self._history[key])
-                ax.plot(steps, values, color="tab:blue")
-                ax.set_xlabel("step")
-                ax.set_ylabel(key)
-                ax.set_title(key)
+                self._draw(ax, key, plot_style.COLORS.get(key, "tab:blue"))
+                plot_style.style_axes(ax, self.x_label, plot_style.label(key))
             for i in range(len(keys), nrows * ncols):
                 axes[i // ncols][i % ncols].axis("off")
             fig.suptitle(f"{self.experiment_name} / {self.module_name}")
-            fig.tight_layout()
-            overview_path = self.plots_dir / "overview.png"
-            fig.savefig(overview_path, dpi=150)
-            plt.close(fig)
-            written.append(overview_path)
+            written += plot_style.save(fig, self.plots_dir / "overview", formats=("png",))
 
         return written
 
@@ -253,7 +274,7 @@ class ExperimentTracker:
 
         if self._wandb is not None:
             try:
-                for path in plot_paths:
+                for path in (p for p in plot_paths if p.suffix == ".png"):
                     self._wandb.log({f"plots/{path.stem}": self._wandb.Image(str(path))})
                 self._wandb.finish()
             except Exception as e:

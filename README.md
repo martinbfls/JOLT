@@ -114,6 +114,20 @@ are skipped (regenerable in minutes from the gen labels; `--keep-workers` to kee
 `show_results.py`: aggregate CTA/ASR across seeds and produce the paper's main-campaign
 tables/figures.
 
+### Training / generation curves
+
+Every module records its metrics with `ExperimentTracker`: `experiments/<run>/logs/<module>_metrics.json`
+plus paper-style plots (`.png` + `.pdf`, 300 dpi) in `experiments/<run>/plots/<module>/` -- per-epoch
+CTA/ASR for `train_expert`/`train_user` (`cta_asr` figure), and for the label/trigger generation the
+experts' ASR along the optimization (current and initial trigger, plus each retrained expert),
+losses, trigger norm and alignment. Mean +- std over seeds, overlaying tags and the FLIP
+frozen-trigger campaign:
+
+```bash
+python scripts/show_results/plot_training_curves.py --stage gen --tags baseline eps_16_255
+python scripts/show_results/plot_training_curves.py --stage train_user --agg multikrum --budget 1000 --campaigns jolt flip_frozen
+```
+
 ## Supported datasets
 
 CIFAR-10, CIFAR-100, SVHN, Tiny ImageNet.

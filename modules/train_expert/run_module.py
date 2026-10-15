@@ -39,7 +39,8 @@ def run(experiment_name, module_name, **kwargs):
 
     slurm_id = kwargs.get("slurm_id", None)
     args = extract_toml(experiment_name, module_name)
-    tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id)
+    tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id, x_label="Epoch")
+    tracker.add_plot_group("cta_asr", ["cta", "asr"], ylabel="Accuracy (%)")
 
     model_flag = args["model"]
     dataset_flag = args["dataset"]
@@ -57,6 +58,7 @@ def run(experiment_name, module_name, **kwargs):
     output_dir = slurmify_path(args["output_dir"], slurm_id)
     budget = args.get("budget", None)
     seed = args.get("seed", None)
+    track_eval = args.get("track_eval", True)
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
@@ -97,11 +99,11 @@ def run(experiment_name, module_name, **kwargs):
     print(f"[DIAG train_expert] batch_size={batch_size}", flush=True)
     _t0 = _time.time()
 
-    # No per-epoch test_data: mini_train would only print it (record=False); the final
-    # evaluation below is what gets reported.
+    # Per-epoch CTA/ASR (tracked, see track_eval); the final evaluation below is what gets reported.
     mini_train(
         model=model,
         train_data=poison_train,
+        test_data=[test, poison_test.poison_dataset] if track_eval else None,
         batch_size=batch_size,
         opt=opt,
         scheduler=lr_scheduler,

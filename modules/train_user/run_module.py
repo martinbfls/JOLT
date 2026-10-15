@@ -26,7 +26,8 @@ def run(experiment_name, module_name, **kwargs):
 
     slurm_id = kwargs.get('slurm_id', None)
     args = extract_toml(experiment_name, module_name)
-    tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id)
+    tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id, x_label="Epoch")
+    tracker.add_plot_group("cta_asr", ["cta", "asr"], ylabel="Accuracy (%)")
 
     user_model_flag = args["user_model"]
     trainer_flag = args["trainer"]
