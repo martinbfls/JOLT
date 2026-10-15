@@ -71,6 +71,12 @@ def init_delta(mu_shape, strength=6.0, freq=16, horizontal=True, device="cuda", 
     return delta
 
 
+def init_warp_field(k, s, device="cuda"):
+    """Control grid (1, 2, k, k) of a WaNet-style warp, in pixels (dx, dy); zero = identity warp. `s` (max
+    displacement in pixels) is enforced by apply_warp / the optimizer's post-step clamp, not by the init."""
+    return torch.zeros(1, 2, k, k, device=device, requires_grad=True)
+
+
 def compute_batch_gradients(model, loss_fn, batch, create_graph, retain_graph=False):
     model.zero_grad(set_to_none=True)
     x, y = batch
@@ -238,3 +244,28 @@ def raw_to_trigger_preprocess(x_raw: torch.Tensor, delta: torch.Tensor,
     else:
         x_trig = (x_raw + delta.unsqueeze(0)).clamp(0, 1)
     return raw_to_preprocess(x_trig, dataset_flag, model_flag)
+
+
+def apply_warp(x_raw: torch.Tensor, control_grid: torch.Tensor, s: float):
+    """Image-agnostic warp of x_raw ((C, H, W) or (B, C, H, W), in [0, 1]). The (1, 2, k, k) control grid is a
+    displacement field in PIXELS (dx, dy), clamped to [-s, s] here (single source of truth for the budget),
+    bicubically upsampled to (H, W), converted to normalized coordinates and added to the identity sampling grid."""
+    squeeze = x_raw.dim() == 3
+    if squeeze:
+        x_raw = x_raw.unsqueeze(0)
+    B, C, H, W = x_raw.shape
+    cg = control_grid.clamp(-s, s)
+    ups = F.interpolate(cg, size=(H, W), mode="bicubic", align_corners=True)
+    ups = ups.permute(0, 2, 3, 1)  # (1, H, W, 2) = (dx_px, dy_px)
+    scale = torch.tensor([2 / (W - 1), 2 / (H - 1)], device=x_raw.device, dtype=x_raw.dtype).view(1, 1, 1, 2)
+    identity_theta = torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]], device=x_raw.device, dtype=x_raw.dtype)
+    base = F.affine_grid(identity_theta, (1, C, H, W), align_corners=True)
+    grid = (base + ups * scale).clamp(-1, 1)
+    warped = F.grid_sample(x_raw, grid.expand(B, -1, -1, -1), mode="bilinear", align_corners=True,
+                           padding_mode="border")
+    return warped.squeeze(0) if squeeze else warped
+
+
+def raw_to_warp_preprocess(x_raw: torch.Tensor, control_grid: torch.Tensor,
+                           dataset_flag: str, model_flag: str = None, s: float = 1.0):
+    return raw_to_preprocess(apply_warp(x_raw, control_grid, s), dataset_flag, model_flag)

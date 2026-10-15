@@ -415,6 +415,21 @@ class OptimizedPoisoner(Poisoner):
         poisoned_tensor = (x_tensor + delta).clamp(0, 1)  # [C, H, W]
         return transforms.ToPILImage()(poisoned_tensor)
 
+class WarpPoisoner(Poisoner):
+    """Image-agnostic WaNet-style warp. `trigger` is the dict saved by generate_labels_trigger_joint:
+    {"control_grid" (1, 2, k, k) in pixels, "warp_k", "warp_s"}; all the warp logic lives in apply_warp."""
+    def __init__(self, trigger: dict):
+        self.control_grid = trigger["control_grid"].detach()
+        self.k = trigger["warp_k"]
+        self.s = trigger["warp_s"]
+
+    def poison(self, x: Image.Image) -> Image.Image:
+        from modules.optimizing_trigger.utils import apply_warp  # local: utils imports this module
+
+        x_tensor = transforms.ToTensor()(x)  # [C, H, W]
+        return transforms.ToPILImage()(apply_warp(x_tensor, self.control_grid, self.s))
+
+
 class RandomPoisoner(Poisoner):
     def __init__(self, poisoners: Iterable[Poisoner]):
         self.poisoners = poisoners
@@ -522,6 +537,15 @@ def make_dataloader(
     return dataloader
 
 
+def _load_warp_trigger(delta):
+    """The "warp" flag takes the saved trigger dict (or a path to it) through the `delta` argument."""
+    assert delta is not None, "The saved trigger dict must be provided (as delta) for the warp poisoner."
+    trigger = torch.load(delta) if isinstance(delta, str) else delta
+    if not (isinstance(trigger, dict) and {"control_grid", "warp_k", "warp_s"} <= trigger.keys()):
+        raise TypeError("warp poisoner expects a dict with control_grid, warp_k and warp_s (or a path to one)")
+    return trigger
+
+
 def pick_poisoner(poisoner_flag, dataset_flag, target_label, delta=None):
     if dataset_flag in ["cifar", "cifar_100", "svhn"]:
         x_poisoner = pick_cifar_poisoner(poisoner_flag, delta=delta)
@@ -583,6 +607,9 @@ def pick_cifar_poisoner(poisoner_flag, delta=None):
         else:
             raise TypeError(f"delta must be a path (str) or a torch.Tensor, got {type(delta)}")
         x_poisoner = OptimizedPoisoner(delta=delta_tensor)
+
+    elif poisoner_flag == "warp":
+        x_poisoner = WarpPoisoner(_load_warp_trigger(delta))
     else:
         raise NotImplementedError()
 
@@ -637,6 +664,9 @@ def pick_tiny_imagenet_poisoner(poisoner_flag, delta=None):
         else:
             raise TypeError(f"delta must be a path (str) or a torch.Tensor, got {type(delta)}")
         x_poisoner = OptimizedPoisoner(delta=delta_tensor)
+
+    elif poisoner_flag == "warp":
+        x_poisoner = WarpPoisoner(_load_warp_trigger(delta))
         
     else:
         raise NotImplementedError()

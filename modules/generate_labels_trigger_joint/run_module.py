@@ -41,7 +41,9 @@ from modules.train_expert.utils import checkpoint_callback
 from modules.optimizing_trigger.utils import (
     get_mu,
     init_delta,
+    init_warp_field,
     raw_to_trigger_preprocess,
+    raw_to_warp_preprocess,
     get_raw_clean_dataset,
     trigger_penalty,
     trigger_penalty_hinge,
@@ -133,8 +135,16 @@ def run(experiment_name, module_name, **kwargs):
             "mean aggregation; a non-mean run confounds the aggregator with the attack factor."
         )
 
+    trigger_type = args.get("trigger_type", "additive")
+    if trigger_type not in ("additive", "warp"):
+        raise ValueError(f"trigger_type must be 'additive' or 'warp', got {trigger_type!r}")
+    is_warp = trigger_type == "warp"
+    warp_k = args.get("warp_k", 4)
+    warp_s = args.get("warp_s", 1.0)  # max displacement, in pixels
+
     epsilon = args.get("epsilon", 0.1)
-    lr_delta = args.get("lr_delta", 1e-2)
+    # for the warp, the optimized variable (the control grid, in pixels) plays delta's role but lives on another scale
+    lr_delta = args.get("lr_warp", 1e-1) if is_warp else args.get("lr_delta", 1e-2)
     lambda_bd = args.get("lambda_bd", 1.0)
     lambda_joint = args.get("lambda_joint", 0.0)
     track_joint = lambda_joint != 0
@@ -189,7 +199,9 @@ def run(experiment_name, module_name, **kwargs):
 
     lambda_lpips = args.get("lambda_lpips", 0.0)
     lpips_model = None
-    if lambda_lpips > 0:
+    if lambda_lpips > 0 and is_warp:
+        print("WARNING: lambda_lpips is defined on the additive pixel delta -- ignored for trigger_type='warp'.")
+    elif lambda_lpips > 0:
         import lpips as _lpips_pkg
 
         lpips_model = _lpips_pkg.LPIPS(net="alex")
@@ -294,29 +306,48 @@ def run(experiment_name, module_name, **kwargs):
         )
     )
 
-    delta = init_delta(
-        mu.shape,
-        horizontal=True,
-        strength=6.0,
-        freq=16,
-        device=device,
-        init=init,
-    )
+    def apply_trigger(x_raw, d):
+        """Preprocessed triggered images for the optimized variable d (additive delta or warp control grid)."""
+        if is_warp:
+            return raw_to_warp_preprocess(
+                x_raw, d, dataset_flag=dataset_flag, model_flag=expert_model_flag, s=warp_s,
+            )
+        return raw_to_trigger_preprocess(x_raw, d, dataset_flag=dataset_flag, model_flag=expert_model_flag)
 
-    max_reachable_l2 = epsilon * math.sqrt(delta.numel())
-    delta_min = delta_min_frac * max_reachable_l2
-    if delta_min > max_reachable_l2:
-        raise ValueError(
-            f"delta_min={delta_min:.4f} (delta_min_frac={delta_min_frac} * "
-            f"max_reachable=epsilon*sqrt(d)={max_reachable_l2:.4f}) exceeds the feasible "
-            f"||delta||_2 ceiling under ||delta||_inf<=epsilon={epsilon} -- structurally "
-            "unreachable post-clamp. delta_min_frac must be <= 1.0."
+    def trigger_artifact(d):
+        """What is saved / handed to the poisoner: the bare tensor (additive) or the dict that rebuilds the warp."""
+        if is_warp:
+            return {"trigger_type": "warp", "control_grid": d.detach().cpu(), "warp_k": warp_k, "warp_s": warp_s}
+        return d.detach().cpu()
+
+    if is_warp:
+        delta = init_warp_field(warp_k, warp_s, device=device)
+    else:
+        delta = init_delta(
+            mu.shape,
+            horizontal=True,
+            strength=6.0,
+            freq=16,
+            device=device,
+            init=init,
         )
-    print(
-        f"delta_min={delta_min:.6f} ({delta_min_frac} * max_reachable=epsilon*sqrt(d)="
-        f"{max_reachable_l2:.6f}); ||delta_init||_2 (raw, pre-clamp)="
-        f"{delta.detach().norm().item():.6f}"
-    )
+
+    delta_min = None
+    if not is_warp:
+        max_reachable_l2 = epsilon * math.sqrt(delta.numel())
+        delta_min = delta_min_frac * max_reachable_l2
+        if delta_min > max_reachable_l2:
+            raise ValueError(
+                f"delta_min={delta_min:.4f} (delta_min_frac={delta_min_frac} * "
+                f"max_reachable=epsilon*sqrt(d)={max_reachable_l2:.4f}) exceeds the feasible "
+                f"||delta||_2 ceiling under ||delta||_inf<=epsilon={epsilon} -- structurally "
+                "unreachable post-clamp. delta_min_frac must be <= 1.0."
+            )
+        print(
+            f"delta_min={delta_min:.6f} ({delta_min_frac} * max_reachable=epsilon*sqrt(d)="
+            f"{max_reachable_l2:.6f}); ||delta_init||_2 (raw, pre-clamp)="
+            f"{delta.detach().norm().item():.6f}"
+        )
     delta.requires_grad_(True)
     optimizer_delta = torch.optim.Adam([delta], lr=lr_delta)
 
@@ -410,7 +441,7 @@ def run(experiment_name, module_name, **kwargs):
         print(
             f"[expert_retrain] round {round_idx}: retraining a fresh expert for "
             f"{expert_retrain_epochs} epochs against the CURRENT trigger "
-            f"(||delta||_inf={delta_snapshot.abs().max().item():.4f})..."
+            f"(||{'control_grid' if is_warp else 'delta'}||_inf={delta_snapshot.abs().max().item():.4f})..."
         )
 
         if expert_retrain_agg_method != agg_method:
@@ -430,10 +461,10 @@ def run(experiment_name, module_name, **kwargs):
             torch.manual_seed(seed)
 
         poisoner = pick_poisoner(
-            "optimized",
+            trigger_type if is_warp else "optimized",
             dataset_flag,
             target_label,
-            delta=delta_snapshot.detach().cpu(),
+            delta=trigger_artifact(delta_snapshot),
         )
         poison_train, _, test, poison_test, _ = get_matching_datasets(
             dataset_flag,
@@ -618,12 +649,7 @@ def run(experiment_name, module_name, **kwargs):
                             if is_poisoned.any():
                                 idx_poisoned = idx[is_poisoned].tolist()
                                 x_raw_adv = _raw_poison_batch(idx_poisoned)
-                                x_trig = raw_to_trigger_preprocess(
-                                    x_raw_adv,
-                                    delta,
-                                    dataset_flag=dataset_flag,
-                                    model_flag=expert_model_flag,
-                                )
+                                x_trig = apply_trigger(x_raw_adv, delta)
                                 x_t_adv = x_t.clone()
 
                                 x_t_adv[is_poisoned_dev] = x_trig
@@ -806,14 +832,15 @@ def run(experiment_name, module_name, **kwargs):
 
                 grand_loss = gamma_stealth * (mtt_term_avg + reg_term)
 
-                L_pen = trigger_penalty(delta, mu)
-                L_tv = tv_loss(delta)
-                grand_loss = grand_loss + (lambda_penalty * L_pen + lambda_delta * delta.norm() + lambda_tv * L_tv)
+                if not is_warp:  # pixel-delta penalties: undefined for the warp
+                    L_pen = trigger_penalty(delta, mu)
+                    L_tv = tv_loss(delta)
+                    grand_loss = grand_loss + (lambda_penalty * L_pen + lambda_delta * delta.norm() + lambda_tv * L_tv)
 
-                L_align, _ = directional_floor_penalty(delta, mu, align_kappa)
-                L_mag, _ = magnitude_floor_penalty(delta, delta_min)
-                if trigger_constraint == "penalty":
-                    grand_loss = grand_loss + (lambda_align * L_align + lambda_mag * L_mag)
+                    L_align, _ = directional_floor_penalty(delta, mu, align_kappa)
+                    L_mag, _ = magnitude_floor_penalty(delta, delta_min)
+                    if trigger_constraint == "penalty":
+                        grand_loss = grand_loss + (lambda_align * L_align + lambda_mag * L_mag)
 
                 grand_loss = grand_loss + lambda_gradmatch * L_gradmatch_avg
                 grand_loss = grand_loss + lambda_match * L_match_avg
@@ -875,7 +902,9 @@ def run(experiment_name, module_name, **kwargs):
                 optimizer_delta.step()
 
                 with torch.no_grad():
-                    if trigger_constraint == "projection":
+                    if is_warp:
+                        delta.clamp_(-warp_s, warp_s)
+                    elif trigger_constraint == "projection":
                         delta.copy_(project_trigger_constraints(delta, mu, epsilon, align_kappa, delta_min))
                     else:
                         delta.clamp_(-epsilon, epsilon)
@@ -891,11 +920,14 @@ def run(experiment_name, module_name, **kwargs):
                 with torch.no_grad():
                     delta_l2 = delta.norm().item()
                     delta_linf = delta.abs().max().item()
-                    L_align_post, cos_target_post = directional_floor_penalty(delta, mu, align_kappa)
-                    cos_target_post, L_align_post = cos_target_post.item(), L_align_post.item()
-                    cos_source_post = cosine_to(delta, mu_source).item()
-                    L_mag_post, _ = magnitude_floor_penalty(delta, delta_min)
-                    L_mag_post = L_mag_post.item()
+                    if is_warp:
+                        L_align_post = cos_target_post = cos_source_post = L_mag_post = 0.0
+                    else:
+                        L_align_post, cos_target_post = directional_floor_penalty(delta, mu, align_kappa)
+                        cos_target_post, L_align_post = cos_target_post.item(), L_align_post.item()
+                        cos_source_post = cosine_to(delta, mu_source).item()
+                        L_mag_post, _ = magnitude_floor_penalty(delta, delta_min)
+                        L_mag_post = L_mag_post.item()
 
                     delta_sign = delta.sign()
                     if prev_delta_sign is None:
@@ -909,24 +941,14 @@ def run(experiment_name, module_name, **kwargs):
                         delta_init = delta.detach().clone()
                     cos_to_init = cosine_to(delta, delta_init).item()
                     delta_drift_l2 = (delta - delta_init).norm().item()
-                    if just_captured:
+                    if just_captured and delta_init.norm() > 0:
                         assert abs(cos_to_init - 1.0) < 1e-5 and delta_drift_l2 < 1e-6, (
                             f"delta_init was just captured but cos_to_init={cos_to_init}, "
                             f"delta_drift_l2={delta_drift_l2} -- expected exactly 1.0/0.0."
                         )
 
-                    x_trig_eval = raw_to_trigger_preprocess(
-                        asr_eval_raw,
-                        delta,
-                        dataset_flag=dataset_flag,
-                        model_flag=expert_model_flag,
-                    )
-                    x_trig_eval_frozen = raw_to_trigger_preprocess(
-                        asr_eval_raw,
-                        delta_init,
-                        dataset_flag=dataset_flag,
-                        model_flag=expert_model_flag,
-                    )
+                    x_trig_eval = apply_trigger(asr_eval_raw, delta)
+                    x_trig_eval_frozen = apply_trigger(asr_eval_raw, delta_init)
                     asr_mean_list = [
                         (m(x_trig_eval).argmax(dim=1) == target_label).float().mean().item() for m in expert_models
                     ]
@@ -1027,7 +1049,7 @@ def run(experiment_name, module_name, **kwargs):
     trig_path = (
         Path(output_dir_trigger) / f"opt_trig_direct_joint_{init}_{expert_model_flag}_{dataset_flag}_{run_tag}.pt"
     )
-    torch.save(delta.detach().cpu(), trig_path)
+    torch.save(trigger_artifact(delta), trig_path)
     print(f"Saved trigger to {trig_path}")
 
 
