@@ -142,6 +142,18 @@ python scripts/show_results/plot_asr_per_seed.py --tags baseline eps_16_255
 python scripts/show_results/plot_asr_per_seed.py --campaign flip_frozen
 ```
 
+### Flip matrices (which class goes to which)
+
+`scripts/show_results/plot_flip_matrix.py` draws confusion-style matrices of the selected label flips
+from `select_flips/<budget>.npy` vs `true.npy`: entry (i, j) is the share of true-class-i samples flipped
+to class j (diagonal masked by default), averaged over seeds, one matrix per budget plus a side-by-side
+figure and a long-format CSV:
+
+```bash
+python scripts/show_results/plot_flip_matrix.py --tags baseline eps_16_255
+python scripts/show_results/plot_flip_matrix.py --campaign flip_frozen --budgets 500 2500 5000 --counts
+```
+
 ### Training / generation curves
 
 Every module records its metrics with `ExperimentTracker`: `experiments/<run>/logs/<module>_metrics.json`
