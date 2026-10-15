@@ -1,0 +1,7 @@
+# Defaults for backdoorbench/attack/jolt.py (copied to <BackdoorBench>/config/attack/jolt/default.yaml).
+# flips_dir / budget / trigger_path are passed on the command line by run_backdoorbench.sh.
+attack: jolt
+attack_label_trans: all2one
+attack_target: 4   # paper_main_campaign TARGET_LABEL
+source_label: 9    # paper_main_campaign SOURCE_LABEL
+pratio: 0.0        # unused: the poisoned set is JOLT's flips

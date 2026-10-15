@@ -98,6 +98,23 @@ Run from the repo root, after generating the configs. Every script supports `DRY
   ./orchestrate_student_machines/kill_all.sh
   ```
 
+## BackdoorBench detection (appendix)
+
+`backdoorbench/` runs [BackdoorBench](https://github.com/SCLBD/BackdoorBench)'s backdoor
+detection methods on existing JOLT results, without regenerating any attack: `attack/jolt.py`
+rebuilds a CIFAR-10 cell's poisoned training set from its single_user `select_flips` output
+(flipped labels on clean images) and its trigger, BackdoorBench trains its own victim
+(PreAct-ResNet18), then the data-level (`detection_pretrain/`: AC, SS, SPECTRE, SCAn, Beatrix,
+AGPD) and inference-time (`detection_infer/`: STRIP, SentiNet, TeCo) detectors run unchanged.
+BackdoorBench (CC BY-NC 4.0) stays a separate checkout.
+
+```bash
+git clone https://github.com/SCLBD/BackdoorBench ~/BackdoorBench   # + its sh/install.sh
+BB_DIR=~/BackdoorBench TAGS=baseline SEEDS=0 BUDGETS=1000 ./backdoorbench/run_backdoorbench.sh
+BB_DIR=~/BackdoorBench REFERENCE_ATTACKS="badnet blended" ./backdoorbench/run_backdoorbench.sh
+python backdoorbench/collect_backdoorbench.py --bb-dir ~/BackdoorBench    # CSV + appendix LaTeX table
+```
+
 ## Backing up results
 
 `make backup` uploads `experiments/` to a private Hugging Face dataset (`<hf user>/jolt-results`,
