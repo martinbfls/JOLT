@@ -169,14 +169,15 @@ def clf_correct(y_pred: torch.Tensor, y: torch.Tensor):
     if len(y.shape) > 1 and y.shape[1] > 1:
         y = torch.argmax(y, dim=1)
     y_hat = y_pred.data.max(1)[1]
-    correct = (y_hat == y).long().cpu().sum()
+    correct = (y_hat == y).long().sum()
     return correct
 
 
 def clf_eval(model: torch.nn.Module, data: Union[DataLoader, Dataset]):
     device = get_module_device(model)
     dataloader, _ = either_dataloader_dataset_to_both(data, eval=True)
-    total_correct, total_loss = 0.0, 0.0
+    total_correct = torch.zeros((), dtype=torch.long, device=device)
+    total_loss = torch.zeros((), dtype=torch.float64, device=device)
     with torch.no_grad():
         model.eval()
         for x, y in dataloader:
@@ -185,12 +186,12 @@ def clf_eval(model: torch.nn.Module, data: Union[DataLoader, Dataset]):
             loss = clf_loss(y_pred, y)
             correct = clf_correct(y_pred, y)
 
-            total_correct += correct.item()
-            total_loss += loss.item()
+            total_correct += correct
+            total_loss += loss.double()
 
     n = len(dataloader.dataset)
-    total_correct /= n
-    total_loss /= n
+    total_correct = total_correct.item() / n
+    total_loss = total_loss.item() / n
     return total_correct, total_loss
 
 
@@ -238,7 +239,9 @@ def mini_train(
 
     with make_pbar(total=total_examples) as pbar:
         for epoch in range(1, epochs + 1):
-            train_epoch_loss, train_epoch_correct = 0, 0
+            # Accumulated on device: a per-batch .item() would force a GPU sync every step.
+            train_epoch_loss = torch.zeros((), dtype=torch.float64, device=device)
+            train_epoch_correct = torch.zeros((), dtype=torch.long, device=device)
             model.train()
             for i, (x, y) in enumerate(dataloader):
                 x, y = x.to(device), y.to(device)
@@ -249,12 +252,14 @@ def mini_train(
                 correct = clf_correct(y_pred, y)
                 loss.backward()
                 opt.step()
-                train_epoch_correct += int(correct.item())
-                train_epoch_loss += float(loss.item())
+                train_epoch_correct += correct
+                train_epoch_loss += loss.detach().double()
                 pbar.update(minibatch_size)
                 if callback is not None:
                     callback(model, opt, epoch, i)
 
+            train_epoch_loss = train_epoch_loss.item()
+            train_epoch_correct = train_epoch_correct.item()
             lr = get_mean_lr(opt)
             if scheduler:
                 scheduler.step()
@@ -369,8 +374,9 @@ def mini_train_multi(
     with make_pbar(total=total_examples) as pbar:
         for epoch in range(1, epochs + 1):
             model.train()
-            train_epoch_loss = 0.0
-            train_epoch_correct = 0
+            # Accumulated on device: a per-worker .item() would force a GPU sync every step.
+            train_epoch_loss = torch.zeros((), dtype=torch.float64, device=device)
+            train_epoch_correct = torch.zeros((), dtype=torch.long, device=device)
 
             if track_grad_proximity:
                 epoch_cos_values = []
@@ -379,8 +385,6 @@ def mini_train_multi(
             for batches in zip(*dataloaders):
                 grad_buffer = [[] for _ in model.parameters()]
 
-                batch_loss = 0.0
-                batch_correct = 0
                 batch_samples = 0
 
                 if track_poison_selection:
@@ -396,7 +400,9 @@ def mini_train_multi(
                     x, y = x.to(device), y.to(device)
                     batch_samples += len(x)
 
-                    model.zero_grad()
+                    # set_to_none: the next backward allocates fresh .grad tensors, so the
+                    # ones buffered below are never overwritten and need no copy.
+                    model.zero_grad(set_to_none=True)
                     y_pred = model(x)
                     loss = clf_loss(y_pred, y)
                     correct = clf_correct(y_pred, y)
@@ -405,10 +411,10 @@ def mini_train_multi(
 
                     for i, p in enumerate(model.parameters()):
                         if p.grad is not None:
-                            grad_buffer[i].append(p.grad.detach().clone())
+                            grad_buffer[i].append(p.grad.detach())
 
-                    batch_loss += loss.item() * len(x)
-                    batch_correct += correct.item()
+                    train_epoch_loss += loss.detach().double() * len(x)
+                    train_epoch_correct += correct
 
                 if track_poison_selection:
                     step_selected_workers = set()
@@ -483,8 +489,6 @@ def mini_train_multi(
                     if any_selected_given_flip:
                         poison_stats["any_poisoned_selected_given_flip"] += 1
 
-                train_epoch_loss += batch_loss
-                train_epoch_correct += batch_correct
                 pbar.update(batch_samples)
 
                 if callback is not None:
@@ -493,6 +497,8 @@ def mini_train_multi(
             if scheduler:
                 scheduler.step()
 
+            train_epoch_loss = train_epoch_loss.item()
+            train_epoch_correct = train_epoch_correct.item()
             lr = get_mean_lr(opt)
             postfix = {
                 "acc": "%.2f" % (train_epoch_correct / total_samples * 100),

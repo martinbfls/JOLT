@@ -97,10 +97,11 @@ def run(experiment_name, module_name, **kwargs):
     print(f"[DIAG train_expert] batch_size={batch_size}", flush=True)
     _t0 = _time.time()
 
+    # No per-epoch test_data: mini_train would only print it (record=False); the final
+    # evaluation below is what gets reported.
     mini_train(
         model=model,
         train_data=poison_train,
-        test_data=[test, poison_test.poison_dataset],
         batch_size=batch_size,
         opt=opt,
         scheduler=lr_scheduler,

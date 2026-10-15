@@ -58,7 +58,6 @@ from modules.generate_labels_trigger_joint.utils import (
     lpips_penalty,
     margin_floor_penalty,
     poison_consistency,
-    coordinate_budget_penalty,
 )
 
 
@@ -68,7 +67,7 @@ def run(experiment_name, module_name, **kwargs):
     all federated clients before the differentiable SGD step producing expert_next_param.
     Optional add-ons (all off by default): live expert retraining, gradient-mismatch/
     aggregate-match penalties, an LPIPS penalty, and anti-collapse floors on delta's norm/
-    alignment/margin/consistency/budget.
+    alignment/margin/consistency.
 
     :param experiment_name: Name of the experiment in configuration.
     :param module_name: Name of the module in configuration.
@@ -143,10 +142,6 @@ def run(experiment_name, module_name, **kwargs):
     lambda_consistency = args.get("lambda_consistency", 0.0)
     track_consistency = lambda_consistency != 0
 
-    lambda_budget = args.get("lambda_budget", 0.0)
-    z_budget = args.get("z_budget", 1.0)
-    track_budget = lambda_budget != 0 and num_honests > 0
-
     expert_retrain_agg_method = args.get("expert_retrain_agg_method", agg_method)
 
     lambda_balance_interval = args.get("lambda_balance_interval", 0)
@@ -155,7 +150,6 @@ def run(experiment_name, module_name, **kwargs):
         {
             "L_bd": 0.45,
             "L_consistency": 0.20,
-            "L_budget": 0.20,
             "L_gradmatch": 0.10,
             "L_lpips": 0.05,
         },
@@ -172,6 +166,11 @@ def run(experiment_name, module_name, **kwargs):
 
     lambda_match = args.get("lambda_match", 0.0)
     track_match = lambda_match != 0
+
+    # Per-poisoned-client grad of L_bd w.r.t. the expert params, with create_graph=True (a
+    # second-order graph over the whole expert): only L_gradmatch, L_match and L_consistency
+    # read it, so it is skipped when all three are off.
+    track_poison_grad = track_gradmatch or track_match or track_consistency
 
     lambda_lpips = args.get("lambda_lpips", 0.0)
     lpips_model = None
@@ -330,6 +329,16 @@ def run(experiment_name, module_name, **kwargs):
                 break
     asr_eval_raw = torch.stack(asr_eval_raw).to(device)
 
+    # Raw (un-normalized) poisoned images, decoded once and kept on device instead of being
+    # re-read from raw_train_dataset at every step.
+    raw_poison_cache = {}
+
+    def _raw_poison_batch(indices):
+        for i in indices:
+            if i not in raw_poison_cache:
+                raw_poison_cache[i] = raw_train_dataset[i][0].to(device)
+        return torch.stack([raw_poison_cache[i] for i in indices])
+
     delta_init = None
     prev_delta_sign = None
 
@@ -411,7 +420,7 @@ def run(experiment_name, module_name, **kwargs):
             target_label,
             delta=delta_snapshot.detach().cpu(),
         )
-        poison_train, _, test, poison_test, _ = get_matching_datasets(
+        poison_train, *_ = get_matching_datasets(
             dataset_flag,
             poisoner,
             clean_label,
@@ -429,10 +438,10 @@ def run(experiment_name, module_name, **kwargs):
             scheduler_kwargs=expert_retrain_scheduler_kwargs,
         )
         round_dir = retrain_base_dir / f"round{round_idx}" / "0"
+        # No per-epoch test_data: mini_train would only print it (record=False, result unused).
         mini_train(
             model=retrain_model,
             train_data=poison_train,
-            test_data=[test, poison_test.poison_dataset],
             batch_size=retrain_batch_size,
             opt=retrain_opt,
             scheduler=retrain_sched,
@@ -527,15 +536,12 @@ def run(experiment_name, module_name, **kwargs):
                 margin_list = []
                 margin_raw_mean_list = []
                 consistency_list = []
-                budget_list = []
-                z_emp_median_list = []
-                z_emp_frac_over_1_list = []
 
                 for k, (checkpoint, state_dict) in enumerate(checkpoints_k):
                     expert_model = expert_models[k]
                     student_model = student_models[k]
                     expert_model.load_state_dict(checkpoint)
-                    student_model.load_state_dict({kk: v.clone() for kk, v in checkpoint.items()})
+                    student_model.load_state_dict(checkpoint)
 
                     expert_start = [p.clone() for p in expert_model.parameters()]
 
@@ -559,8 +565,6 @@ def run(experiment_name, module_name, **kwargs):
                     margin_sum = torch.tensor(0.0, device=device)
                     margin_raw_sum = torch.tensor(0.0, device=device)
 
-                    n_honest_contributed = 0
-
                     for cid, batch in enumerate(batches):
                         if cid < num_honests:
                             x, y, _, _, _, is_p = batch
@@ -580,7 +584,6 @@ def run(experiment_name, module_name, **kwargs):
                                     student_grad_buf[i].append(g)
                                     if track_gradmatch:
                                         clean_grad_chunks[i].append(g)
-                            n_honest_contributed += 1
 
                         # POISONED CLIENTS
                         else:
@@ -594,7 +597,7 @@ def run(experiment_name, module_name, **kwargs):
                             x_t_adv = x_t
                             if is_poisoned.any():
                                 idx_poisoned = idx[is_poisoned].tolist()
-                                x_raw_adv = torch.stack([raw_train_dataset[i][0] for i in idx_poisoned]).to(device)
+                                x_raw_adv = _raw_poison_batch(idx_poisoned)
                                 x_trig = raw_to_trigger_preprocess(
                                     x_raw_adv,
                                     delta,
@@ -656,7 +659,6 @@ def run(experiment_name, module_name, **kwargs):
                                     margin_sum = margin_sum + L_margin_cid
                                     margin_raw_sum = margin_raw_sum + margin_raw_cid.detach()
 
-                                track_poison_grad = True
                                 grad_targets = [delta] + expert_params if track_poison_grad else [delta]
 
                                 bd_grads = torch.autograd.grad(
@@ -708,7 +710,9 @@ def run(experiment_name, module_name, **kwargs):
                     )
 
                     consistency_k = (
-                        poison_consistency(poison_grad_chunks) if have_poison_grad else torch.tensor(0.0, device=device)
+                        poison_consistency(poison_grad_chunks)
+                        if track_consistency and have_poison_grad
+                        else torch.tensor(0.0, device=device)
                     )
                     consistency_list.append(consistency_k)
 
@@ -726,31 +730,6 @@ def run(experiment_name, module_name, **kwargs):
                     agg_student_grads = agg(student_params, student_grad_buf, agg_method, f=num_poisoned)
 
                     agg_expert_grads = agg(expert_params, expert_grad_buf, agg_method, f=num_poisoned)
-
-                    if n_honest_contributed > 0:
-                        honest_grads_flat = torch.stack(
-                            [
-                                torch.cat([expert_grad_buf[i][j].reshape(-1) for i in range(len(expert_params))])
-                                for j in range(n_honest_contributed)
-                            ]
-                        )
-                        g_poison_flat = torch.cat([agg_expert_grads[i].reshape(-1) for i in range(len(expert_params))])
-                        mu_h_diag = honest_grads_flat.mean(0)
-                        sd_h_diag = honest_grads_flat.std(0) + 1e-8
-                        z_emp = (g_poison_flat.detach() - mu_h_diag).abs() / sd_h_diag
-                        z_emp_median_list.append(z_emp.median().item())
-                        z_emp_frac_over_1_list.append((z_emp > 1.0).float().mean().item())
-                        if track_budget:
-                            budget_k = coordinate_budget_penalty(
-                                g_poison_flat,
-                                honest_grads_flat,
-                                z_budget,
-                            )
-                        else:
-                            budget_k = torch.tensor(0.0, device=device)
-                    else:
-                        budget_k = torch.tensor(0.0, device=device)
-                    budget_list.append(budget_k)
 
                     if track_match and poison_grad_mean is not None:
                         L_match_k = grad_cosine_penalty(agg_expert_grads, poison_grad_mean)
@@ -804,7 +783,6 @@ def run(experiment_name, module_name, **kwargs):
                 L_match_avg = torch.stack(match_list).mean()
                 margin_avg = torch.stack(margin_list).mean()
                 consistency_avg = torch.stack(consistency_list).mean()
-                budget_avg = torch.stack(budget_list).mean()
 
                 grand_loss = gamma_stealth * (mtt_term_avg + reg_term)
 
@@ -823,7 +801,6 @@ def run(experiment_name, module_name, **kwargs):
                 grand_loss = grand_loss + lambda_margin * margin_avg
 
                 grand_loss = grand_loss + lambda_consistency * consistency_avg
-                grand_loss = grand_loss + lambda_budget * budget_avg
 
                 if do_balance:
 
@@ -845,8 +822,6 @@ def run(experiment_name, module_name, **kwargs):
 
                     if lambda_consistency != 0:
                         balance_targets["L_consistency"] = (lambda_consistency * consistency_avg, "lambda_consistency")
-                    if lambda_budget != 0:
-                        balance_targets["L_budget"] = (lambda_budget * budget_avg, "lambda_budget")
                     for name, (term, lambda_attr) in balance_targets.items():
                         ratio_i = lambda_balance_ratios.get(name)
                         if ratio_i is None:
@@ -867,8 +842,6 @@ def run(experiment_name, module_name, **kwargs):
                             lambda_lpips = new_val
                         elif lambda_attr == "lambda_consistency":
                             lambda_consistency = new_val
-                        elif lambda_attr == "lambda_budget":
-                            lambda_budget = new_val
 
                 optimizer_labels.zero_grad()
                 grand_loss.backward()
@@ -987,17 +960,11 @@ def run(experiment_name, module_name, **kwargs):
                             "margin_mean": float(np.mean(margin_raw_mean_list)),
                             "L_consistency": consistency_avg.item(),
                             "poison_consistency": consistency_avg.item(),
-                            "L_budget": budget_avg.item(),
-                            "z_emp_median": (float(np.mean(z_emp_median_list)) if z_emp_median_list else None),
-                            "z_emp_frac_over_1": (
-                                float(np.mean(z_emp_frac_over_1_list)) if z_emp_frac_over_1_list else None
-                            ),
                             "delta_sign_flip_rate": delta_sign_flip_rate,
                             "lambda_bd_current": lambda_bd,
                             "lambda_gradmatch_current": lambda_gradmatch,
                             "lambda_lpips_current": lambda_lpips,
                             "lambda_consistency_current": lambda_consistency,
-                            "lambda_budget_current": lambda_budget,
                         }
                     )
                 tracker.log(
@@ -1017,7 +984,6 @@ def run(experiment_name, module_name, **kwargs):
                     L_match=L_match_avg.item(),
                     L_margin=margin_avg.item(),
                     L_consistency=consistency_avg.item(),
-                    L_budget=budget_avg.item(),
                     delta_sign_flip_rate=delta_sign_flip_rate,
                 )
 

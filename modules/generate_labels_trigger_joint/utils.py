@@ -161,12 +161,6 @@ def poison_consistency(poison_grad_chunks, eps=1e-8):
     return 1.0 - F.cosine_similarity(G, g_bar.unsqueeze(0).expand_as(G), dim=1, eps=eps).mean()
 
 
-def coordinate_budget_penalty(g_poison, honest_grads_flat, z, eps=1e-8):
-    """Penalizes g_poison's per-coordinate deviation from the honest mean beyond z honest std devs; differentiable everywhere, unlike Krum/median."""
-    mu_h, sd_h = honest_grads_flat.mean(0), honest_grads_flat.std(0) + eps
-    return F.relu((g_poison - mu_h).abs() - z * sd_h).pow(2).mean()
-
-
 def lpips_penalty(delta, x_raw_clean, lpips_model):
     """Perceptual (LPIPS) distance between the clean raw image(s) and their triggered counterpart, differentiable w.r.t. delta."""
     if x_raw_clean.dim() == 3:
