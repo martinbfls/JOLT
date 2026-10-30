@@ -6,6 +6,7 @@ import argparse
 import math
 import os
 import random
+import sys
 from pathlib import Path
 
 import toml
@@ -244,6 +245,93 @@ def trigger_output_path(module_dir, model_flag, dataset, num_poisoned, num_hones
 
 def cell_name(model_flag, dataset, agg_method, seed):
     return f"{model_flag}/{dataset}/{NUM_POISONED}vs{NUM_HONESTS}/{agg_method}/seed{seed}"
+
+
+def generate_federated_deploy(
+    model_flag,
+    dataset,
+    seed,
+    budgets,
+    trigger_type,
+    deploy_num_poisoned,
+    deploy_num_honests,
+    deploy_agg_method,
+    gen_agg_method="mean",
+    init=None,
+    dry_run=False,
+):
+    """Re-deploys an ALREADY-GENERATED trigger (from a prior --single-cell/--minimal/--all run,
+    GEN side fixed at NUM_POISONED/NUM_HONESTS, agg_method=gen_agg_method) under federated
+    aggregation: writes a NEW federated_select_flips + federated_train_user (NOT a re-run of
+    GEN/train_expert -- select_flips genuinely must be redone here, since its flip assignment
+    depends on num_honests/num_poisoned, which differ between the single-user GEN deployment and
+    this federated one). Returns (paths, trigger_path, trigger_exists)."""
+    init = INIT if init is None else init
+    if trigger_type not in ("additive", "warp"):
+        raise ValueError(f"trigger_type must be 'additive' or 'warp', got {trigger_type!r}")
+    poisoner = "warp" if trigger_type == "warp" else "optimized"
+
+    lr = LEARNING_RATE.get(model_flag, 0.1)
+    wd = WEIGHT_DECAY.get(model_flag, 2e-4)
+    milestones = MILESTONE.get(model_flag, [75, 125])
+
+    cell_dir = EXP_BASE / cell_name(model_flag, dataset, gen_agg_method, seed)
+    module_dir = cell_dir / "gen_labels_trigger_joint"
+    trig_path = trigger_output_path(module_dir, model_flag, dataset, NUM_POISONED, NUM_HONESTS, init)
+    trigger_exists = trig_path.exists()
+
+    deploy_dir = cell_dir / f"{deploy_agg_method}_{deploy_num_poisoned}vs{deploy_num_honests}"
+    flips_dir = deploy_dir / "select_flips"
+
+    configs = {
+        flips_dir / "config.toml": SELECT_FLIPS_TEMPLATE.format(
+            budgets=budgets,
+            module_dir=module_dir,
+            flips_dir=flips_dir,
+            num_honests=deploy_num_honests,
+            num_poisoned=deploy_num_poisoned,
+        ),
+    }
+    for budget in budgets:
+        train_user_dir = deploy_dir / f"train_user_{budget}"
+        configs[train_user_dir / "config.toml"] = TRAIN_USER_TEMPLATE.format(
+            flips_dir=flips_dir,
+            train_user_dir=train_user_dir,
+            model_flag=model_flag,
+            dataset=dataset,
+            source_label=SOURCE_LABEL,
+            target_label=TARGET_LABEL,
+            trigger_path=trig_path,
+            poisoner=poisoner,
+            budget=budget,
+            num_honests=deploy_num_honests,
+            num_poisoned=deploy_num_poisoned,
+            agg_method=deploy_agg_method,
+            lr=lr,
+            wd=wd,
+            milestones=milestones,
+            wandb_block_train_user=wandb_block(
+                "federated_train_user",
+                f"train_user/{model_flag}/{dataset}/{deploy_agg_method}/{budget}/seed{seed}",
+                enabled=WANDB_ENABLED,
+                project=WANDB_PROJECT,
+                mode=WANDB_MODE,
+                entity=WANDB_ENTITY,
+                group=model_flag,
+            ),
+        )
+
+    paths = []
+    for path, content in configs.items():
+        assert "out/checkpoints" not in str(path), f"Refusing to write under out/checkpoints/: {path}"
+        if dry_run:
+            paths.append(path)
+            continue
+        write_config(path, content)
+        validate_config(path)
+        paths.append(path)
+
+    return paths, trig_path, trigger_exists
 
 
 def generate_cell(
@@ -560,6 +648,30 @@ if __name__ == "__main__":
         "--exp-base-tag when that is set (so e.g. --exp-base-tag warp also isolates checkpoints "
         "unless you pass --checkpoint-tag explicitly); pass --checkpoint-tag '' to force sharing.",
     )
+    parser.add_argument(
+        "--deploy-federated",
+        action="store_true",
+        help="re-deploy an ALREADY-GENERATED single-cell trigger (--model-flag/--dataset/--seed) "
+        "under federated aggregation: writes only a NEW federated_select_flips + "
+        "federated_train_user (the GEN/train_expert phases are NOT re-run -- the trigger must "
+        "already exist on disk). Combine with --deploy-num-poisoned/--deploy-num-honests/"
+        "--deploy-agg-method and --budgets/--trigger-type/--exp-base-tag.",
+    )
+    parser.add_argument("--deploy-num-poisoned", type=int, default=3, help="with --deploy-federated")
+    parser.add_argument("--deploy-num-honests", type=int, default=7, help="with --deploy-federated")
+    parser.add_argument(
+        "--deploy-agg-method",
+        default="multikrum",
+        choices=["mean", "median", "trmean", "krum", "multikrum", "krum_full", "multikrum_full", "geomed"],
+        help="with --deploy-federated",
+    )
+    parser.add_argument(
+        "--gen-agg-method",
+        default="mean",
+        help="with --deploy-federated: agg_method the GEN cell was originally generated under "
+        "(gen_configs.py's own single-cell default is 'mean') -- used only to locate the "
+        "already-generated trigger/cell directory, not written into the new federated configs.",
+    )
     args = parser.parse_args()
 
     if args.exp_base_tag is not None:
@@ -586,6 +698,35 @@ if __name__ == "__main__":
         import json
 
         print(json.dumps(list_grid(), indent=2))
+        raise SystemExit(0)
+
+    if args.deploy_federated:
+        assert args.budgets is not None, "--deploy-federated requires --budgets"
+        paths, trig_path, trigger_exists = generate_federated_deploy(
+            model_flag=args.model_flag or MODEL_FLAGS[0],
+            dataset=args.dataset or DATASETS[0],
+            seed=args.seed if args.seed is not None else SEEDS[0],
+            budgets=budgets_override,
+            trigger_type=TRIGGER_TYPE,
+            deploy_num_poisoned=args.deploy_num_poisoned,
+            deploy_num_honests=args.deploy_num_honests,
+            deploy_agg_method=args.deploy_agg_method,
+            gen_agg_method=args.gen_agg_method,
+            dry_run=args.dry_run,
+        )
+        if not trigger_exists:
+            print(
+                f"[ABORT] trigger not found at {trig_path} -- run the GEN phase for this cell "
+                "first (e.g. --single-cell with the same --model-flag/--dataset/--seed/--trigger-type/"
+                "--exp-base-tag) before --deploy-federated.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        label = "[DRY RUN]" if args.dry_run else ""
+        print(f"\n{label} generate_labels_trigger_joint (federated deploy): {len(paths)} config files "
+              f"{'would be ' if args.dry_run else ''}written, trigger={trig_path}")
+        for p in paths:
+            print(f"  {p}")
         raise SystemExit(0)
 
     assert not (args.minimal and args.single_cell), "pass at most one of --minimal/--single-cell"
