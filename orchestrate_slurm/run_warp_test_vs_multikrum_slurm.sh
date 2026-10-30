@@ -126,6 +126,19 @@ gen_barrier=$(submit_barrier_slurm "warp_barrier_gen" "afterok:$(join_job_ids "$
 echo "[PHASE] GEN submitted -> barrier $gen_barrier"
 
 # ---------------------------------------------------------------------------
+# Side job: automatic trigger visualization, right after GEN -- doesn't
+# block/gate either branch below, just runs off gen_barrier in parallel.
+# ---------------------------------------------------------------------------
+VIZ_OUT="$CELL_REL/gen_labels_trigger_joint/trigger_preview.png"
+viz_cmd="python scripts/show_results/visualize_trigger.py --exp-base experiments/$EXP_BASE_REL"
+viz_cmd+=" --model-flag $MODEL_FLAG --dataset $DATASET --seed $SEED --trigger-type warp"
+viz_cmd+=" --out experiments/$VIZ_OUT"
+VIZ_JOBS=("$viz_cmd|warp_viz_${MODEL_FLAG}_${DATASET}_seed${SEED}")
+TIME_PER_TASK="00:05:00"
+GPUS_PER_TASK=0 CPUS_PER_TASK=2 MEM_PER_TASK=4G submit_job_pool_slurm VIZ_JOBS "warp_viz" "afterok:$gen_barrier" || exit 1
+echo "[PHASE] trigger visualization submitted -> will land at experiments/$VIZ_OUT"
+
+# ---------------------------------------------------------------------------
 # Branch A: centralized (1 poisoned / 0 honest, mean -- a no-op aggregator)
 # ---------------------------------------------------------------------------
 CEN_FLIPS_JOBS=("python run_experiment.py $CELL_REL/select_flips|warp_cen_flips_${MODEL_FLAG}_${DATASET}_seed${SEED}")
@@ -174,6 +187,7 @@ echo "[PHASE] FEDERATED USER submitted (${#FED_USER_JOBS[@]} jobs)."
 
 echo "[DONE] warp least-constrained campaign submitted: centralized AND federated ($DEPLOY_AGG_METHOD) branches both queued off the same trigger."
 echo "[COMPARE] once finished, compare:"
+echo "  trigger visual: experiments/$VIZ_OUT (ready right after GEN, before either branch finishes)"
 for budget in $BUDGETS_SINGLE; do
     echo "  centralized: experiments/$CELL_REL/train_user_${budget}/logs/federated_train_user_metrics.json"
     echo "  federated:   experiments/$FED_DEPLOY_REL/train_user_${budget}/logs/federated_train_user_metrics.json"
