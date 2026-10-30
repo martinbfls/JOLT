@@ -151,7 +151,7 @@ CONDA_MODULE="${CONDA_MODULE:-}"
 # Absolute path of the conda installation (the output of `conda info --base`).
 # Used when no module provides conda. Leave empty to skip conda activation.
 CONDA_BASE="${CONDA_BASE:-}"
-CONDA_ENV="${CONDA_ENV:-/shared/data1/Projects/DLWP/j1067582/martin/FLIP/envs/flip_x86_64}"
+CONDA_ENV="${CONDA_ENV:-/shared/data1/Projects/DLWP/j1067582/martin/JOLT/envs/flip_x86_64}"
 
 # Working directory the jobs cd into (the caller normally exports this).
 BASE_DIR="${BASE_DIR:-$PWD}"
