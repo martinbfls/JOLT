@@ -130,7 +130,7 @@ def check_delta_min_feasible(dataset, epsilon, delta_min_frac, init="stripe"):
 
 
 TRAIN_EXPERT_TEMPLATE = """[train_expert]
-output_dir = "{cluster_root}/out/checkpoints/{model_flag}_1xs/seed{seed}/0/"
+output_dir = "{cluster_root}/out/checkpoints/{ckpt_subdir}/seed{seed}/0/"
 model = "{model_flag}"
 dataset = "{dataset}"
 trainer = "sgd"
@@ -145,8 +145,8 @@ seed = {rng_seed}
 {wandb_block_train_expert}"""
 
 JOINT_TRIGGER_TEMPLATE = """[generate_labels_trigger_joint]
-input_pths = "{cluster_root}/out/checkpoints/{model_flag}_1xs/seed{seed}/{{}}/model_{{}}_{{}}.pth"
-opt_pths = "{cluster_root}/out/checkpoints/{model_flag}_1xs/seed{seed}/{{}}/model_{{}}_{{}}_opt.pth"
+input_pths = "{cluster_root}/out/checkpoints/{ckpt_subdir}/seed{seed}/{{}}/model_{{}}_{{}}.pth"
+opt_pths = "{cluster_root}/out/checkpoints/{ckpt_subdir}/seed{seed}/{{}}/model_{{}}_{{}}_opt.pth"
 output_dir = "{cell_dir}/labels/"
 output_dir_trigger = "{cell_dir}/trigger"
 expert_model = "{model_flag}"
@@ -260,6 +260,7 @@ def generate_cell(
     warp_k=None,
     warp_s=None,
     lr_warp=None,
+    checkpoint_tag=None,
 ):
     delta_min_frac = DELTA_MIN_FRAC if delta_min_frac is None else delta_min_frac
     init = INIT if init is None else init
@@ -271,6 +272,7 @@ def generate_cell(
     if trigger_type not in ("additive", "warp"):
         raise ValueError(f"trigger_type must be 'additive' or 'warp', got {trigger_type!r}")
     poisoner = "warp" if trigger_type == "warp" else "optimized"
+    ckpt_subdir = f"{model_flag}_1xs" if checkpoint_tag is None else f"{model_flag}_1xs_{checkpoint_tag}"
 
     if CHECKPOINT_SAMPLING != INDIRECT_MODULE_CHECKPOINT_SAMPLING:
         print(
@@ -299,13 +301,14 @@ def generate_cell(
     rng_seed = draw_rng_seed(model_flag, seed)
 
     cell_dir = EXP_BASE / cell_name(model_flag, dataset, agg_method, seed)
-    train_expert_dir = EXP_BASE / f"train_expert/{model_flag}_1xs/seed{seed}"
+    train_expert_dir = EXP_BASE / f"train_expert/{ckpt_subdir}/seed{seed}"
     module_dir = cell_dir / "gen_labels_trigger_joint"
     flips_dir = cell_dir / "select_flips"
 
     configs = {
         train_expert_dir / "config.toml": TRAIN_EXPERT_TEMPLATE.format(
             cluster_root=CLUSTER_ROOT,
+            ckpt_subdir=ckpt_subdir,
             model_flag=model_flag,
             dataset=dataset,
             seed=seed,
@@ -329,6 +332,7 @@ def generate_cell(
         ),
         module_dir / "config.toml": JOINT_TRIGGER_TEMPLATE.format(
             cluster_root=CLUSTER_ROOT,
+            ckpt_subdir=ckpt_subdir,
             model_flag=model_flag,
             dataset=dataset,
             seed=seed,
@@ -434,6 +438,7 @@ def generate_cell(
 
 def generate_single_cell(
     dry_run=True, budgets=None, model_flag=None, dataset=None, agg_method=None, seed=None,
+    checkpoint_tag=None,
 ):
     """Exactly one cell (default: first model/dataset/agg_method/seed) at default regularization.
     budgets=None (default): just BUDGETS[:1] (one train_user config). Pass an explicit list
@@ -449,6 +454,7 @@ def generate_single_cell(
         seed,
         BUDGETS[:1] if budgets is None else budgets,
         dry_run=dry_run,
+        checkpoint_tag=checkpoint_tag,
     )
     refused = [(model_flag, dataset, agg_method, seed, reason)] if reason else []
     return paths, refused
@@ -546,10 +552,23 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", default=None, help="override DATASETS[0] for --single-cell")
     parser.add_argument("--agg-method", default=None, help="override AGG_METHODS[0] for --single-cell")
     parser.add_argument("--seed", type=int, default=None, help="override SEEDS[0] for --single-cell")
+    parser.add_argument(
+        "--checkpoint-tag",
+        default=None,
+        help="suffix for the train_expert checkpoint subdir (out/checkpoints/{model_flag}_1xs_<tag>/...), "
+        "so a side-by-side run doesn't race on/clobber the same checkpoint files. Defaults to "
+        "--exp-base-tag when that is set (so e.g. --exp-base-tag warp also isolates checkpoints "
+        "unless you pass --checkpoint-tag explicitly); pass --checkpoint-tag '' to force sharing.",
+    )
     args = parser.parse_args()
 
     if args.exp_base_tag is not None:
         EXP_BASE = EXP_BASE.parent / f"{EXP_BASE.name}_{args.exp_base_tag}"
+    checkpoint_tag = args.checkpoint_tag
+    if checkpoint_tag is None:
+        checkpoint_tag = args.exp_base_tag
+    elif checkpoint_tag == "":
+        checkpoint_tag = None
     budgets_override = None
     if args.budgets is not None:
         budgets_override = [int(b) for b in args.budgets.replace(",", " ").split()]
@@ -579,6 +598,7 @@ if __name__ == "__main__":
             dataset=args.dataset,
             agg_method=args.agg_method,
             seed=args.seed,
+            checkpoint_tag=checkpoint_tag,
         )
     elif args.minimal:
         paths, refused = generate_minimal_campaign(dry_run=args.dry_run)
