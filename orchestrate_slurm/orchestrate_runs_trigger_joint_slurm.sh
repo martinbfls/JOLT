@@ -145,7 +145,7 @@ for model_flag in "${MODEL_FLAGS[@]}"; do
     for agg in "${AGG_METHODS[@]}"; do
       for seed in "${SEEDS[@]}"; do
         if [ "$USER_ONLY" != "1" ]; then
-          expert_key="${model_flag}_seed${seed}"
+          expert_key="${model_flag}_seed${seed}${CHECKPOINT_TAG:+_${CHECKPOINT_TAG}}"
           if [[ " $SEEN_EXPERT " != *" $expert_key "* ]]; then
             SEEN_EXPERT="$SEEN_EXPERT $expert_key"
             expert_cfg="$EXP_BASE_REL/train_expert/${model_flag}_1xs${CKPT_SUBDIR_SUFFIX}/seed${seed}"
@@ -155,7 +155,7 @@ for model_flag in "${MODEL_FLAGS[@]}"; do
         fi
 
         cell="$(cell_dir "$model_flag" "$dataset" "$agg" "$seed")"
-        tag="${model_flag}_${dataset}_${agg}_seed${seed}"
+        tag="${model_flag}_${dataset}_${agg}_seed${seed}${CHECKPOINT_TAG:+_${CHECKPOINT_TAG}}"
 
         if [ "$USER_ONLY" != "1" ]; then
           gen_cfg="$cell/gen_labels_trigger_joint"
