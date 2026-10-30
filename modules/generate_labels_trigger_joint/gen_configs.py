@@ -432,17 +432,25 @@ def generate_cell(
     return paths, None
 
 
-def generate_single_cell(dry_run=True):
-    """Exactly one cell (first model/dataset/agg_method/seed, first budget) at default regularization."""
+def generate_single_cell(
+    dry_run=True, budgets=None, model_flag=None, dataset=None, agg_method=None, seed=None,
+):
+    """Exactly one cell (default: first model/dataset/agg_method/seed) at default regularization.
+    budgets=None (default): just BUDGETS[:1] (one train_user config). Pass an explicit list
+    (e.g. via --budgets) to get a train_user config per budget in that same single cell."""
+    model_flag = MODEL_FLAGS[0] if model_flag is None else model_flag
+    dataset = DATASETS[0] if dataset is None else dataset
+    agg_method = AGG_METHODS[0] if agg_method is None else agg_method
+    seed = SEEDS[0] if seed is None else seed
     paths, reason = generate_cell(
-        MODEL_FLAGS[0],
-        DATASETS[0],
-        AGG_METHODS[0],
-        SEEDS[0],
-        BUDGETS[:1],
+        model_flag,
+        dataset,
+        agg_method,
+        seed,
+        BUDGETS[:1] if budgets is None else budgets,
         dry_run=dry_run,
     )
-    refused = [(MODEL_FLAGS[0], DATASETS[0], AGG_METHODS[0], SEEDS[0], reason)] if reason else []
+    refused = [(model_flag, dataset, agg_method, seed, reason)] if reason else []
     return paths, refused
 
 
@@ -527,10 +535,25 @@ if __name__ == "__main__":
         "(e.g. additive vs. warp) writes to a sibling experiments/ tree instead of colliding "
         "on the same cell paths",
     )
+    parser.add_argument(
+        "--budgets",
+        default=None,
+        help="comma/space-separated list of flip budgets, overriding BUDGETS (e.g. '1500' or "
+        "'150,500,1500'). With --single-cell this produces one train_user config per budget "
+        "in that one cell (default without this flag: just BUDGETS[:1]).",
+    )
+    parser.add_argument("--model-flag", default=None, help="override MODEL_FLAGS[0] for --single-cell")
+    parser.add_argument("--dataset", default=None, help="override DATASETS[0] for --single-cell")
+    parser.add_argument("--agg-method", default=None, help="override AGG_METHODS[0] for --single-cell")
+    parser.add_argument("--seed", type=int, default=None, help="override SEEDS[0] for --single-cell")
     args = parser.parse_args()
 
     if args.exp_base_tag is not None:
         EXP_BASE = EXP_BASE.parent / f"{EXP_BASE.name}_{args.exp_base_tag}"
+    budgets_override = None
+    if args.budgets is not None:
+        budgets_override = [int(b) for b in args.budgets.replace(",", " ").split()]
+        BUDGETS = budgets_override
     if args.trigger_type is not None:
         TRIGGER_TYPE = args.trigger_type
     if args.warp_k is not None:
@@ -549,12 +572,18 @@ if __name__ == "__main__":
     assert not (args.minimal and args.single_cell), "pass at most one of --minimal/--single-cell"
 
     if args.single_cell:
-        gen_fn = generate_single_cell
+        paths, refused = generate_single_cell(
+            dry_run=args.dry_run,
+            budgets=budgets_override,
+            model_flag=args.model_flag,
+            dataset=args.dataset,
+            agg_method=args.agg_method,
+            seed=args.seed,
+        )
     elif args.minimal:
-        gen_fn = generate_minimal_campaign
+        paths, refused = generate_minimal_campaign(dry_run=args.dry_run)
     else:
-        gen_fn = generate_all_configs
-    paths, refused = gen_fn(dry_run=args.dry_run)
+        paths, refused = generate_all_configs(dry_run=args.dry_run)
 
     if args.dry_run:
         print(f"\n[DRY RUN] {MODULE_NAME}: {len(paths)} config files would be written.")

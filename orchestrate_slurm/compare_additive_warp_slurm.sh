@@ -49,10 +49,10 @@ echo "[PLAN] comparing trigger_type=additive vs trigger_type=warp on $MODEL_FLAG
 
 for VARIANT in additive warp; do
     echo "[GEN] generating $VARIANT configs (exp-base-tag=$VARIANT)..."
-    GEN_ARGS=(--single-cell --trigger-type "$VARIANT" --exp-base-tag "$VARIANT")
+    GEN_ARGS=(--single-cell --trigger-type "$VARIANT" --exp-base-tag "$VARIANT" --budgets "$BUDGETS_SINGLE"
+              --model-flag "$MODEL_FLAG" --dataset "$DATASET" --seed "$SEED")
     [ "$DRY_RUN" = "1" ] && GEN_ARGS+=(--dry-run)
-    MODEL_FLAGS="$MODEL_FLAG" DATASETS="$DATASET" SEEDS="$SEED" BUDGETS="$BUDGETS_SINGLE" \
-        python -m modules.generate_labels_trigger_joint.gen_configs "${GEN_ARGS[@]}"
+    python -m modules.generate_labels_trigger_joint.gen_configs "${GEN_ARGS[@]}"
 done
 
 for VARIANT in additive warp; do
