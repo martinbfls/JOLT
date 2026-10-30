@@ -85,6 +85,14 @@ DELTA_MIN_FRAC = 0.00
 # "random" (unseeded global torch RNG).
 INIT = "stripe"
 
+# trigger_type (run_module.py): "additive" (default, optimizes the pixel delta) or "warp"
+# (WaNet-style learned control-grid warp, see schemas/generate_labels_trigger_joint.toml).
+# The warp_*/lr_warp knobs below are only used when TRIGGER_TYPE == "warp".
+TRIGGER_TYPE = "additive"
+WARP_K = 4
+WARP_S = 1.0
+LR_WARP = 0.1
+
 LAMBDA_GRADMATCH = 1.0
 GRADMATCH_EPS = 1e-8
 GRADMATCH_METRIC = "relerr"  # or "cosine"
@@ -166,6 +174,11 @@ alpha_ckpt = {alpha_ckpt}
 
 init = "{init}"
 
+trigger_type = "{trigger_type}"
+warp_k = {warp_k}
+warp_s = {warp_s}
+lr_warp = {lr_warp}
+
 trigger_constraint = "{trigger_constraint}"
 align_kappa = {align_kappa}
 lambda_align = {lambda_align}
@@ -209,7 +222,7 @@ trainer = "sgd"
 dataset = "{dataset}"
 source_label = {source_label}
 target_label = {target_label}
-poisoner = "optimized"
+poisoner = "{poisoner}"
 delta = "{trigger_path}"
 budget = {budget}
 num_honests = {num_honests}
@@ -243,10 +256,21 @@ def generate_cell(
     delta_min_frac=None,
     init=None,
     detach_param_dist=None,
+    trigger_type=None,
+    warp_k=None,
+    warp_s=None,
+    lr_warp=None,
 ):
     delta_min_frac = DELTA_MIN_FRAC if delta_min_frac is None else delta_min_frac
     init = INIT if init is None else init
     detach_param_dist = DETACH_PARAM_DIST if detach_param_dist is None else detach_param_dist
+    trigger_type = TRIGGER_TYPE if trigger_type is None else trigger_type
+    warp_k = WARP_K if warp_k is None else warp_k
+    warp_s = WARP_S if warp_s is None else warp_s
+    lr_warp = LR_WARP if lr_warp is None else lr_warp
+    if trigger_type not in ("additive", "warp"):
+        raise ValueError(f"trigger_type must be 'additive' or 'warp', got {trigger_type!r}")
+    poisoner = "warp" if trigger_type == "warp" else "optimized"
 
     if CHECKPOINT_SAMPLING != INDIRECT_MODULE_CHECKPOINT_SAMPLING:
         print(
@@ -334,6 +358,10 @@ def generate_cell(
             lambda_mag=LAMBDA_MAG,
             delta_min_frac=delta_min_frac,
             init=init,
+            trigger_type=trigger_type,
+            warp_k=warp_k,
+            warp_s=warp_s,
+            lr_warp=lr_warp,
             expert_retrain_interval=EXPERT_RETRAIN_INTERVAL,
             expert_retrain_epochs=EXPERT_RETRAIN_EPOCHS,
             expert_retrain_checkpoint_iters=EXPERT_RETRAIN_CHECKPOINT_ITERS,
@@ -372,6 +400,7 @@ def generate_cell(
             source_label=SOURCE_LABEL,
             target_label=TARGET_LABEL,
             trigger_path=trigger_path,
+            poisoner=poisoner,
             budget=budget,
             num_honests=NUM_HONESTS,
             num_poisoned=NUM_POISONED,
@@ -482,7 +511,25 @@ if __name__ == "__main__":
         action="store_true",
         help="print this campaign's sweep cells as JSON and exit, without writing configs",
     )
+    parser.add_argument(
+        "--trigger-type",
+        choices=["additive", "warp"],
+        default=None,
+        help="override TRIGGER_TYPE: 'warp' uses a learned WaNet-style warp trigger instead of the additive delta",
+    )
+    parser.add_argument("--warp-k", type=int, default=None, help="override WARP_K (warp control-grid side)")
+    parser.add_argument("--warp-s", type=float, default=None, help="override WARP_S (max warp displacement, px)")
+    parser.add_argument("--lr-warp", type=float, default=None, help="override LR_WARP")
     args = parser.parse_args()
+
+    if args.trigger_type is not None:
+        TRIGGER_TYPE = args.trigger_type
+    if args.warp_k is not None:
+        WARP_K = args.warp_k
+    if args.warp_s is not None:
+        WARP_S = args.warp_s
+    if args.lr_warp is not None:
+        LR_WARP = args.lr_warp
 
     if args.print_grid:
         import json
