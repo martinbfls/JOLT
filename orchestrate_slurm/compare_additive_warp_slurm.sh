@@ -27,6 +27,33 @@ BASE_DIR="${BASE_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 export BASE_DIR
 cd "$BASE_DIR"
 
+# shellcheck source=slurm_lib.sh
+source "$SCRIPT_DIR/slurm_lib.sh"
+
+# The config generation (gen_configs.py) just writes/validates .toml files --
+# no GPU needed -- but needs the conda env's python, which is normally only
+# on compute nodes, not the login node. Run it via `srun` on a tiny CPU
+# allocation instead of requiring an active conda env / python in PATH here.
+GEN_TIME="${GEN_CONFIGS_TIME:-00:10:00}"
+GEN_CPUS="${GEN_CONFIGS_CPUS:-2}"
+GEN_MEM="${GEN_CONFIGS_MEM:-4G}"
+
+run_gen_configs_on_compute_node() {
+    srun -A "$SLURM_ACCOUNT" -p "$SLURM_PARTITION" \
+        --cpus-per-task="$GEN_CPUS" --mem="$GEN_MEM" --time="$GEN_TIME" \
+        bash -c "
+            set -euo pipefail
+            cd '$BASE_DIR'
+            unset PYTHONPATH PYTHONHOME || true
+            export PATH='$CONDA_ENV/bin:\$PATH'
+            if [ \"\$(command -v python)\" != '$CONDA_ENV/bin/python' ]; then
+                echo '[gen_configs] FATAL: python is '\"\$(command -v python)\"', expected $CONDA_ENV/bin/python' >&2
+                exit 1
+            fi
+            python -m modules.generate_labels_trigger_joint.gen_configs $*
+        "
+}
+
 MODEL_FLAGS_SINGLE="${MODEL_FLAGS:-r32p}"
 DATASETS_SINGLE="${DATASETS:-cifar}"
 SEEDS_SINGLE="${SEEDS:-0}"
@@ -52,7 +79,7 @@ for VARIANT in additive warp; do
     GEN_ARGS=(--single-cell --trigger-type "$VARIANT" --exp-base-tag "$VARIANT" --budgets "$BUDGETS_SINGLE"
               --model-flag "$MODEL_FLAG" --dataset "$DATASET" --seed "$SEED")
     [ "$DRY_RUN" = "1" ] && GEN_ARGS+=(--dry-run)
-    python -m modules.generate_labels_trigger_joint.gen_configs "${GEN_ARGS[@]}"
+    run_gen_configs_on_compute_node "${GEN_ARGS[@]}"
 done
 
 for VARIANT in additive warp; do
