@@ -520,8 +520,17 @@ if __name__ == "__main__":
     parser.add_argument("--warp-k", type=int, default=None, help="override WARP_K (warp control-grid side)")
     parser.add_argument("--warp-s", type=float, default=None, help="override WARP_S (max warp displacement, px)")
     parser.add_argument("--lr-warp", type=float, default=None, help="override LR_WARP")
+    parser.add_argument(
+        "--exp-base-tag",
+        default=None,
+        help="suffix appended to EXP_BASE's dir name (e.g. 'warp'), so a side-by-side run "
+        "(e.g. additive vs. warp) writes to a sibling experiments/ tree instead of colliding "
+        "on the same cell paths",
+    )
     args = parser.parse_args()
 
+    if args.exp_base_tag is not None:
+        EXP_BASE = EXP_BASE.parent / f"{EXP_BASE.name}_{args.exp_base_tag}"
     if args.trigger_type is not None:
         TRIGGER_TYPE = args.trigger_type
     if args.warp_k is not None:
