@@ -88,6 +88,7 @@ for VARIANT in additive warp; do
     MODEL_FLAGS="$MODEL_FLAG" DATASETS="$DATASET" SEEDS="$SEED" BUDGETS="$BUDGETS_SINGLE" \
     AGG_METHODS=mean NUM_POISONED=1 NUM_HONESTS=0 \
     EXP_BASE_REL="federated_experiments/threat_model_direct_trigger_joint_${VARIANT}" \
+    CHECKPOINT_TAG="$VARIANT" \
     DRY_RUN="$DRY_RUN" \
         "$SCRIPT_DIR/orchestrate_runs_trigger_joint_slurm.sh"
 done

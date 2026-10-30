@@ -94,6 +94,14 @@ read -ra BUDGETS     <<< "${BUDGETS:-150 300 500 1000 2000 2500 5000}"
 NUM_POISONED="${NUM_POISONED:-1}"
 NUM_HONESTS="${NUM_HONESTS:-0}"
 
+# Suffix of the train_expert checkpoint subdir (out/checkpoints/{model_flag}_1xs[_<tag>]/...),
+# must match whatever --checkpoint-tag gen_configs.py was run with (defaults to --exp-base-tag
+# there, so e.g. EXP_BASE_REL=..._warp with no override also used checkpoint subdir
+# "{model_flag}_1xs_warp" -- set CHECKPOINT_TAG to the same value here, or "" if none was used).
+CHECKPOINT_TAG="${CHECKPOINT_TAG:-}"
+CKPT_SUBDIR_SUFFIX=""
+[ -n "$CHECKPOINT_TAG" ] && CKPT_SUBDIR_SUFFIX="_${CHECKPOINT_TAG}"
+
 # gen_configs.py's EXP_BASE, relative to experiments/ (what run_experiment.py
 # expects: it prepends "experiments/" and appends "/config.toml" itself).
 EXP_BASE_REL="${EXP_BASE_REL:-federated_experiments/threat_model_direct_trigger_joint}"
@@ -140,7 +148,7 @@ for model_flag in "${MODEL_FLAGS[@]}"; do
           expert_key="${model_flag}_seed${seed}"
           if [[ " $SEEN_EXPERT " != *" $expert_key "* ]]; then
             SEEN_EXPERT="$SEEN_EXPERT $expert_key"
-            expert_cfg="$EXP_BASE_REL/train_expert/${model_flag}_1xs/seed${seed}"
+            expert_cfg="$EXP_BASE_REL/train_expert/${model_flag}_1xs${CKPT_SUBDIR_SUFFIX}/seed${seed}"
             require_config "$expert_cfg"
             EXPERT_JOBS+=("python run_experiment.py $expert_cfg|joint_expert_${expert_key}")
           fi
