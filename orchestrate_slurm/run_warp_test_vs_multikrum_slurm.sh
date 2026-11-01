@@ -158,7 +158,7 @@ for budget in $BUDGETS_SINGLE; do
     CEN_USER_JOBS+=("python run_experiment.py $CELL_REL/train_user_${budget}|${VARIANT_TAG}_cen_user_${MODEL_FLAG}_${DATASET}_seed${SEED}_${budget}")
 done
 TIME_PER_TASK="$USER_TIME"
-submit_job_pool_slurm CEN_USER_JOBS "${VARIANT_TAG}_cen_user" "afterok:$cen_flips_barrier" || exit 1
+submit_job_pool_slurm CEN_USER_JOBS "${VARIANT_TAG}_cen_user_seed${SEED}" "afterok:$cen_flips_barrier" || exit 1
 echo "[PHASE] CENTRALIZED USER submitted (${#CEN_USER_JOBS[@]} jobs)."
 
 # ---------------------------------------------------------------------------
@@ -188,7 +188,7 @@ for budget in $BUDGETS_SINGLE; do
     FED_USER_JOBS+=("python run_experiment.py $FED_DEPLOY_REL/train_user_${budget}|${VARIANT_TAG}_fed_user_${MODEL_FLAG}_${DATASET}_seed${SEED}_${budget}")
 done
 TIME_PER_TASK="$USER_TIME"
-submit_job_pool_slurm FED_USER_JOBS "${VARIANT_TAG}_fed_user" "afterok:$fed_flips_barrier" || exit 1
+submit_job_pool_slurm FED_USER_JOBS "${VARIANT_TAG}_fed_user_seed${SEED}" "afterok:$fed_flips_barrier" || exit 1
 echo "[PHASE] FEDERATED USER submitted (${#FED_USER_JOBS[@]} jobs)."
 
 echo "[DONE] warp least-constrained campaign submitted: centralized AND federated ($DEPLOY_AGG_METHOD) branches both queued off the same trigger."
