@@ -199,9 +199,7 @@ def run(experiment_name, module_name, **kwargs):
 
     lambda_lpips = args.get("lambda_lpips", 0.0)
     lpips_model = None
-    if lambda_lpips > 0 and is_warp:
-        print("WARNING: lambda_lpips is defined on the additive pixel delta -- ignored for trigger_type='warp'.")
-    elif lambda_lpips > 0:
+    if lambda_lpips > 0:
         import lpips as _lpips_pkg
 
         lpips_model = _lpips_pkg.LPIPS(net="alex")
@@ -728,7 +726,9 @@ def run(experiment_name, module_name, **kwargs):
                                     L_bd_live_total = L_bd_live_total + lambda_bd * L_bd_cid
 
                                 if lpips_model is not None:
-                                    L_lpips_cid = lpips_penalty(delta, x_raw_adv, lpips_model)
+                                    L_lpips_cid = lpips_penalty(
+                                        delta, x_raw_adv, lpips_model, is_warp=is_warp, warp_s=warp_s,
+                                    )
                                     lpips_grad_raw = torch.autograd.grad(
                                         L_lpips_cid,
                                         [delta],

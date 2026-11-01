@@ -78,6 +78,10 @@ LAMBDA_DELTA = 1.0
 # Weight for L_joint (clean-task loss over the WHOLE local batch, additive to delta.grad the
 # same way as L_bd); 0.0 (default) is a full no-op. See schemas/generate_labels_trigger_joint.toml.
 LAMBDA_JOINT = 0.0
+# Weight for a perceptual LPIPS penalty between clean and triggered images (works under both
+# trigger_type='additive' and 'warp'); 0.0 (default) is a full no-op. Requires the `lpips`
+# package when > 0 (lazily imported by run_module.py, not a hard dependency otherwise).
+LAMBDA_LPIPS = 0.0
 
 TRIGGER_CONSTRAINT = "penalty"
 ALIGN_KAPPA = 0.3
@@ -163,6 +167,7 @@ lr_delta = {lr_delta}
 lambda_bd = {lambda_bd}
 lambda_delta = {lambda_delta}
 lambda_joint = {lambda_joint}
+lambda_lpips = {lambda_lpips}
 lambda_gradmatch = {lambda_gradmatch}
 gradmatch_eps = {gradmatch_eps}
 gradmatch_metric = "{gradmatch_metric}"
@@ -355,6 +360,7 @@ def generate_cell(
     checkpoint_tag=None,
     lambda_bd=None,
     lambda_joint=None,
+    lambda_lpips=None,
 ):
     delta_min_frac = DELTA_MIN_FRAC if delta_min_frac is None else delta_min_frac
     init = INIT if init is None else init
@@ -362,6 +368,7 @@ def generate_cell(
     trigger_type = TRIGGER_TYPE if trigger_type is None else trigger_type
     lambda_bd = LAMBDA_BD if lambda_bd is None else lambda_bd
     lambda_joint = LAMBDA_JOINT if lambda_joint is None else lambda_joint
+    lambda_lpips = LAMBDA_LPIPS if lambda_lpips is None else lambda_lpips
     warp_k = WARP_K if warp_k is None else warp_k
     warp_s = WARP_S if warp_s is None else warp_s
     lr_warp = LR_WARP if lr_warp is None else lr_warp
@@ -441,6 +448,7 @@ def generate_cell(
             lambda_bd=lambda_bd,
             lambda_delta=LAMBDA_DELTA,
             lambda_joint=lambda_joint,
+            lambda_lpips=lambda_lpips,
             lambda_gradmatch=LAMBDA_GRADMATCH,
             gradmatch_eps=GRADMATCH_EPS,
             gradmatch_metric=GRADMATCH_METRIC,
@@ -641,6 +649,14 @@ if __name__ == "__main__":
         "schemas/generate_labels_trigger_joint.toml's lambda_joint entry.",
     )
     parser.add_argument(
+        "--lambda-lpips",
+        type=float,
+        default=None,
+        help="override LAMBDA_LPIPS (default 0.0/off): weight for a perceptual LPIPS penalty "
+        "between clean and triggered images. Works under both --trigger-type additive and warp. "
+        "Requires the `lpips` package installed in the conda env when > 0.",
+    )
+    parser.add_argument(
         "--exp-base-tag",
         default=None,
         help="suffix appended to EXP_BASE's dir name (e.g. 'warp'), so a side-by-side run "
@@ -715,6 +731,8 @@ if __name__ == "__main__":
         LAMBDA_BD = args.lambda_bd
     if args.lambda_joint is not None:
         LAMBDA_JOINT = args.lambda_joint
+    if args.lambda_lpips is not None:
+        LAMBDA_LPIPS = args.lambda_lpips
 
     if args.print_grid:
         import json

@@ -20,6 +20,10 @@
 #   SLURM_ACCOUNT=<account> ./orchestrate_slurm/run_warp_test_vs_multikrum_slurm.sh
 #   SLURM_ACCOUNT=<account> DRY_RUN=1 ./orchestrate_slurm/run_warp_test_vs_multikrum_slurm.sh
 #   WARP_S=4.0 BUDGETS=1500 SLURM_ACCOUNT=<account> ./orchestrate_slurm/run_warp_test_vs_multikrum_slurm.sh
+#
+# VARIANT_TAG (default "warp") names this cell's experiments/out/checkpoints subtree AND its
+# Slurm job names -- override it (e.g. per sweep_warp_min_perturbation_slurm.sh cell) to run
+# several WARP_S/LAMBDA_LPIPS combos side by side without colliding on paths or job names.
 ###
 
 set -euo pipefail
@@ -37,6 +41,7 @@ DATASET="${DATASET:-cifar}"
 SEED="${SEED:-0}"
 BUDGETS_SINGLE="${BUDGETS:-1500}"
 DRY_RUN="${DRY_RUN:-0}"
+VARIANT_TAG="${VARIANT_TAG:-warp}"
 
 # Least-constrained warp + rebalanced losses, per this test's spec.
 WARP_S="${WARP_S:-8.0}"
@@ -44,6 +49,7 @@ WARP_K="${WARP_K:-4}"
 LR_WARP="${LR_WARP:-0.1}"
 LAMBDA_BD="${LAMBDA_BD:-1.0}"
 LAMBDA_JOINT="${LAMBDA_JOINT:-1.0}"
+LAMBDA_LPIPS="${LAMBDA_LPIPS:-0.0}"
 
 DEPLOY_NUM_POISONED="${DEPLOY_NUM_POISONED:-3}"
 DEPLOY_NUM_HONESTS="${DEPLOY_NUM_HONESTS:-7}"
@@ -55,11 +61,11 @@ FLIPS_TIME="${FLIPS_TIME:-00:10:00}"
 USER_TIME="${USER_TIME:-0-01:00:00}"
 GEN_CONFIGS_TIME="${GEN_CONFIGS_TIME:-00:10:00}"
 
-EXP_BASE_REL="federated_experiments/threat_model_direct_trigger_joint_warp"
+EXP_BASE_REL="federated_experiments/threat_model_direct_trigger_joint_${VARIANT_TAG}"
 CELL_REL="$EXP_BASE_REL/$MODEL_FLAG/$DATASET/1vs0/mean/seed$SEED"
 FED_DEPLOY_REL="$CELL_REL/${DEPLOY_AGG_METHOD}_${DEPLOY_NUM_POISONED}vs${DEPLOY_NUM_HONESTS}"
 
-echo "[PLAN] warp, least-constrained: warp_s=$WARP_S warp_k=$WARP_K lambda_bd=$LAMBDA_BD lambda_joint=$LAMBDA_JOINT"
+echo "[PLAN] variant=$VARIANT_TAG warp_s=$WARP_S warp_k=$WARP_K lambda_bd=$LAMBDA_BD lambda_joint=$LAMBDA_JOINT lambda_lpips=$LAMBDA_LPIPS"
 echo "[PLAN] model=$MODEL_FLAG dataset=$DATASET seed=$SEED budgets=$BUDGETS_SINGLE"
 echo "[PLAN] centralized (1vs0, mean) vs federated ($DEPLOY_AGG_METHOD, ${DEPLOY_NUM_POISONED}vs${DEPLOY_NUM_HONESTS})"
 
@@ -79,17 +85,17 @@ run_gen_configs_on_compute_node() {
         "
 }
 
-echo "[GEN] regenerating the whole warp cell from scratch (train_expert, gen, centralized flips/user)..."
-GEN_ARGS=(--single-cell --trigger-type warp --exp-base-tag warp
+echo "[GEN] regenerating the whole $VARIANT_TAG cell from scratch (train_expert, gen, centralized flips/user)..."
+GEN_ARGS=(--single-cell --trigger-type warp --exp-base-tag "$VARIANT_TAG"
           --model-flag "$MODEL_FLAG" --dataset "$DATASET" --seed "$SEED" --budgets "$BUDGETS_SINGLE"
           --warp-s "$WARP_S" --warp-k "$WARP_K" --lr-warp "$LR_WARP"
-          --lambda-bd "$LAMBDA_BD" --lambda-joint "$LAMBDA_JOINT")
+          --lambda-bd "$LAMBDA_BD" --lambda-joint "$LAMBDA_JOINT" --lambda-lpips "$LAMBDA_LPIPS")
 [ "$DRY_RUN" = "1" ] && GEN_ARGS+=(--dry-run)
 run_gen_configs_on_compute_node "${GEN_ARGS[@]}"
 
 MISSING=0
 for p in \
-    "$EXP_BASE_REL/train_expert/${MODEL_FLAG}_1xs_warp/seed${SEED}" \
+    "$EXP_BASE_REL/train_expert/${MODEL_FLAG}_1xs_${VARIANT_TAG}/seed${SEED}" \
     "$CELL_REL/gen_labels_trigger_joint" \
     "$CELL_REL/select_flips"; do
     [ -f "experiments/$p/config.toml" ] || { echo "[CONFIG] missing: experiments/$p/config.toml" >&2; MISSING=$((MISSING + 1)); }
@@ -113,16 +119,16 @@ preflight_slurm || exit 1
 # ---------------------------------------------------------------------------
 # Shared trunk: EXPERT -> GEN
 # ---------------------------------------------------------------------------
-EXPERT_JOBS=("python run_experiment.py $EXP_BASE_REL/train_expert/${MODEL_FLAG}_1xs_warp/seed${SEED}|warp_expert_${MODEL_FLAG}_seed${SEED}")
+EXPERT_JOBS=("python run_experiment.py $EXP_BASE_REL/train_expert/${MODEL_FLAG}_1xs_${VARIANT_TAG}/seed${SEED}|${VARIANT_TAG}_expert_${MODEL_FLAG}_seed${SEED}")
 TIME_PER_TASK="$EXPERT_TIME"
-submit_job_pool_slurm EXPERT_JOBS "warp_expert" "" || exit 1
-expert_barrier=$(submit_barrier_slurm "warp_barrier_expert" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+submit_job_pool_slurm EXPERT_JOBS "${VARIANT_TAG}_expert" "" || exit 1
+expert_barrier=$(submit_barrier_slurm "${VARIANT_TAG}_barrier_expert" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
 echo "[PHASE] EXPERT submitted -> barrier $expert_barrier"
 
-GEN_JOBS=("python run_experiment.py $CELL_REL/gen_labels_trigger_joint|warp_gen_${MODEL_FLAG}_${DATASET}_seed${SEED}")
+GEN_JOBS=("python run_experiment.py $CELL_REL/gen_labels_trigger_joint|${VARIANT_TAG}_gen_${MODEL_FLAG}_${DATASET}_seed${SEED}")
 TIME_PER_TASK="$GEN_TIME"
-submit_job_pool_slurm GEN_JOBS "warp_gen" "afterok:$expert_barrier" || exit 1
-gen_barrier=$(submit_barrier_slurm "warp_barrier_gen" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+submit_job_pool_slurm GEN_JOBS "${VARIANT_TAG}_gen" "afterok:$expert_barrier" || exit 1
+gen_barrier=$(submit_barrier_slurm "${VARIANT_TAG}_barrier_gen" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
 echo "[PHASE] GEN submitted -> barrier $gen_barrier"
 
 # ---------------------------------------------------------------------------
@@ -133,26 +139,26 @@ VIZ_OUT="$CELL_REL/gen_labels_trigger_joint/trigger_preview.png"
 viz_cmd="python scripts/show_results/visualize_trigger.py --exp-base experiments/$EXP_BASE_REL"
 viz_cmd+=" --model-flag $MODEL_FLAG --dataset $DATASET --seed $SEED --trigger-type warp"
 viz_cmd+=" --out experiments/$VIZ_OUT"
-VIZ_JOBS=("$viz_cmd|warp_viz_${MODEL_FLAG}_${DATASET}_seed${SEED}")
+VIZ_JOBS=("$viz_cmd|${VARIANT_TAG}_viz_${MODEL_FLAG}_${DATASET}_seed${SEED}")
 TIME_PER_TASK="00:05:00"
-GPUS_PER_TASK=0 CPUS_PER_TASK=2 MEM_PER_TASK=4G submit_job_pool_slurm VIZ_JOBS "warp_viz" "afterok:$gen_barrier" || exit 1
+GPUS_PER_TASK=0 CPUS_PER_TASK=2 MEM_PER_TASK=4G submit_job_pool_slurm VIZ_JOBS "${VARIANT_TAG}_viz" "afterok:$gen_barrier" || exit 1
 echo "[PHASE] trigger visualization submitted -> will land at experiments/$VIZ_OUT"
 
 # ---------------------------------------------------------------------------
 # Branch A: centralized (1 poisoned / 0 honest, mean -- a no-op aggregator)
 # ---------------------------------------------------------------------------
-CEN_FLIPS_JOBS=("python run_experiment.py $CELL_REL/select_flips|warp_cen_flips_${MODEL_FLAG}_${DATASET}_seed${SEED}")
+CEN_FLIPS_JOBS=("python run_experiment.py $CELL_REL/select_flips|${VARIANT_TAG}_cen_flips_${MODEL_FLAG}_${DATASET}_seed${SEED}")
 TIME_PER_TASK="$FLIPS_TIME"
-GPUS_PER_TASK=0 submit_job_pool_slurm CEN_FLIPS_JOBS "warp_cen_flips" "afterok:$gen_barrier" || exit 1
-cen_flips_barrier=$(submit_barrier_slurm "warp_barrier_cen_flips" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+GPUS_PER_TASK=0 submit_job_pool_slurm CEN_FLIPS_JOBS "${VARIANT_TAG}_cen_flips" "afterok:$gen_barrier" || exit 1
+cen_flips_barrier=$(submit_barrier_slurm "${VARIANT_TAG}_barrier_cen_flips" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
 echo "[PHASE] CENTRALIZED FLIPS submitted -> barrier $cen_flips_barrier"
 
 CEN_USER_JOBS=()
 for budget in $BUDGETS_SINGLE; do
-    CEN_USER_JOBS+=("python run_experiment.py $CELL_REL/train_user_${budget}|warp_cen_user_${MODEL_FLAG}_${DATASET}_seed${SEED}_${budget}")
+    CEN_USER_JOBS+=("python run_experiment.py $CELL_REL/train_user_${budget}|${VARIANT_TAG}_cen_user_${MODEL_FLAG}_${DATASET}_seed${SEED}_${budget}")
 done
 TIME_PER_TASK="$USER_TIME"
-submit_job_pool_slurm CEN_USER_JOBS "warp_cen_user" "afterok:$cen_flips_barrier" || exit 1
+submit_job_pool_slurm CEN_USER_JOBS "${VARIANT_TAG}_cen_user" "afterok:$cen_flips_barrier" || exit 1
 echo "[PHASE] CENTRALIZED USER submitted (${#CEN_USER_JOBS[@]} jobs)."
 
 # ---------------------------------------------------------------------------
@@ -162,27 +168,27 @@ echo "[PHASE] CENTRALIZED USER submitted (${#CEN_USER_JOBS[@]} jobs)."
 # at submission time (the trigger doesn't exist yet on the login node).
 # ---------------------------------------------------------------------------
 fed_gen_cmd="python -m modules.generate_labels_trigger_joint.gen_configs --deploy-federated"
-fed_gen_cmd+=" --trigger-type warp --exp-base-tag warp --model-flag $MODEL_FLAG --dataset $DATASET --seed $SEED"
+fed_gen_cmd+=" --trigger-type warp --exp-base-tag $VARIANT_TAG --model-flag $MODEL_FLAG --dataset $DATASET --seed $SEED"
 fed_gen_cmd+=" --budgets '$BUDGETS_SINGLE' --deploy-num-poisoned $DEPLOY_NUM_POISONED"
 fed_gen_cmd+=" --deploy-num-honests $DEPLOY_NUM_HONESTS --deploy-agg-method $DEPLOY_AGG_METHOD"
-FED_GEN_JOBS=("$fed_gen_cmd|warp_fed_gen_${MODEL_FLAG}_${DATASET}_seed${SEED}")
+FED_GEN_JOBS=("$fed_gen_cmd|${VARIANT_TAG}_fed_gen_${MODEL_FLAG}_${DATASET}_seed${SEED}")
 TIME_PER_TASK="$GEN_CONFIGS_TIME"
-GPUS_PER_TASK=0 CPUS_PER_TASK=2 MEM_PER_TASK=4G submit_job_pool_slurm FED_GEN_JOBS "warp_fed_gen" "afterok:$gen_barrier" || exit 1
-fed_gen_barrier=$(submit_barrier_slurm "warp_barrier_fed_gen" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+GPUS_PER_TASK=0 CPUS_PER_TASK=2 MEM_PER_TASK=4G submit_job_pool_slurm FED_GEN_JOBS "${VARIANT_TAG}_fed_gen" "afterok:$gen_barrier" || exit 1
+fed_gen_barrier=$(submit_barrier_slurm "${VARIANT_TAG}_barrier_fed_gen" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
 echo "[PHASE] FED_GEN submitted -> barrier $fed_gen_barrier"
 
-FED_FLIPS_JOBS=("python run_experiment.py $FED_DEPLOY_REL/select_flips|warp_fed_flips_${MODEL_FLAG}_${DATASET}_seed${SEED}")
+FED_FLIPS_JOBS=("python run_experiment.py $FED_DEPLOY_REL/select_flips|${VARIANT_TAG}_fed_flips_${MODEL_FLAG}_${DATASET}_seed${SEED}")
 TIME_PER_TASK="$FLIPS_TIME"
-GPUS_PER_TASK=0 submit_job_pool_slurm FED_FLIPS_JOBS "warp_fed_flips" "afterok:$fed_gen_barrier" || exit 1
-fed_flips_barrier=$(submit_barrier_slurm "warp_barrier_fed_flips" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+GPUS_PER_TASK=0 submit_job_pool_slurm FED_FLIPS_JOBS "${VARIANT_TAG}_fed_flips" "afterok:$fed_gen_barrier" || exit 1
+fed_flips_barrier=$(submit_barrier_slurm "${VARIANT_TAG}_barrier_fed_flips" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
 echo "[PHASE] FEDERATED FLIPS submitted -> barrier $fed_flips_barrier"
 
 FED_USER_JOBS=()
 for budget in $BUDGETS_SINGLE; do
-    FED_USER_JOBS+=("python run_experiment.py $FED_DEPLOY_REL/train_user_${budget}|warp_fed_user_${MODEL_FLAG}_${DATASET}_seed${SEED}_${budget}")
+    FED_USER_JOBS+=("python run_experiment.py $FED_DEPLOY_REL/train_user_${budget}|${VARIANT_TAG}_fed_user_${MODEL_FLAG}_${DATASET}_seed${SEED}_${budget}")
 done
 TIME_PER_TASK="$USER_TIME"
-submit_job_pool_slurm FED_USER_JOBS "warp_fed_user" "afterok:$fed_flips_barrier" || exit 1
+submit_job_pool_slurm FED_USER_JOBS "${VARIANT_TAG}_fed_user" "afterok:$fed_flips_barrier" || exit 1
 echo "[PHASE] FEDERATED USER submitted (${#FED_USER_JOBS[@]} jobs)."
 
 echo "[DONE] warp least-constrained campaign submitted: centralized AND federated ($DEPLOY_AGG_METHOD) branches both queued off the same trigger."
