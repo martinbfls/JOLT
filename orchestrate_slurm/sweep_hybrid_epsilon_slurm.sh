@@ -21,6 +21,11 @@
 # existing warp runs, by default), so the ASR/CTA-vs-budget figure compares them side by side on
 # the same seeds.
 #
+# The final figure job goes to the campaign's own partition (SLURM_PARTITION); override it with
+# SUMMARY_PARTITION if you have a CPU-only one that accepts sbatch from this login node. If it
+# cannot be submitted at all, the campaign is unaffected and the plotting command is printed for
+# you to run by hand -- it needs no Slurm.
+#
 # Usage (from repo root, login-node shell -- rdhpc-n1, not maple-1: the conda env is x86_64):
 #   SLURM_ACCOUNT=<account> ./orchestrate_slurm/sweep_hybrid_epsilon_slurm.sh
 #   SLURM_ACCOUNT=<account> DRY_RUN=1 ./orchestrate_slurm/sweep_hybrid_epsilon_slurm.sh
@@ -72,8 +77,11 @@ DRY_RUN="${DRY_RUN:-0}"
 read -ra REFERENCE_TAGS_ARR <<< "${REFERENCE_TAGS:-warp_s8_lpips0p0 warp_s16_lpips0p0}"
 
 SUMMARY_OUT="${SUMMARY_OUT:-experiments/federated_experiments/hybrid_epsilon_sweep_summary}"
-# CPU-only x86_64 partition for the plotting job (see run_all_out_iclr.sh: maple is aarch64).
-SUMMARY_PARTITION="${SUMMARY_PARTITION:-pine}"
+# Partition for the final (CPU-only) plotting job. Defaults to the campaign's own partition once
+# slurm_lib.sh is sourced: `pine` accepts srun from an RDHPC node but REFUSES sbatch from one
+# ("You must submit your job from that cluster's login node instead"), and the figure job is
+# submitted with sbatch like every other job here.
+SUMMARY_PARTITION="${SUMMARY_PARTITION:-}"
 
 read -ra _BUDGETS_ARR <<< "$BUDGETS_ALL"
 n_cells=$((${#EPSILON_ARR[@]} * ${#WARP_S_ARR[@]} * ${#SEEDS_ARR[@]}))
@@ -88,6 +96,8 @@ sanitize() { echo "$1" | tr '.' 'p' | tr -d '-'; }
 
 # shellcheck source=slurm_lib.sh
 source "$SCRIPT_DIR/slurm_lib.sh"
+
+SUMMARY_PARTITION="${SUMMARY_PARTITION:-$SLURM_PARTITION}"
 
 ALL_FINAL_JOB_IDS=()
 TAGS=()
@@ -144,9 +154,15 @@ fi
 
 preflight_slurm || exit 1
 plot_dep="afterok:$(join_job_ids "${ALL_FINAL_JOB_IDS[@]}")"
-GPUS_PER_TASK=0 CPUS_PER_TASK=4 MEM_PER_TASK=8G TIME_PER_TASK=00:15:00 \
-    plot_job=$(submit_job_slurm "$plot_cmd" "hybrid_sweep_plot" "$plot_dep" "$SUMMARY_PARTITION") || exit 1
-echo "[SWEEP] figure job $plot_job submitted on $SUMMARY_PARTITION, depends on ${#ALL_FINAL_JOB_IDS[@]} final jobs (afterok)"
-echo "[SWEEP] once it completes: $SUMMARY_OUT/asr_cta_vs_budget.png, summary.md, per_seed.csv"
-echo "[SWEEP] a cell that fails leaves the figure job pending -- scancel it and run the command above by hand:"
+# Never `exit 1` on a failed figure submission: the campaign is already queued at this point, so
+# losing the command the user would need afterwards is the worst possible outcome.
+if plot_job=$(GPUS_PER_TASK=0 CPUS_PER_TASK=4 MEM_PER_TASK=8G TIME_PER_TASK=00:15:00 \
+        submit_job_slurm "$plot_cmd" "hybrid_sweep_plot" "$plot_dep" "$SUMMARY_PARTITION"); then
+    echo "[SWEEP] figure job $plot_job submitted on $SUMMARY_PARTITION, depends on ${#ALL_FINAL_JOB_IDS[@]} final jobs (afterok)"
+    echo "[SWEEP] once it completes: $SUMMARY_OUT/asr_cta_vs_budget.png, summary.md, per_seed.csv"
+    echo "[SWEEP] a cell that fails leaves the figure job pending -- scancel it and run this by hand:"
+else
+    echo "[SWEEP] the figure job could NOT be submitted -- the ${#ALL_FINAL_JOB_IDS[@]} campaign jobs above are unaffected." >&2
+    echo "[SWEEP] run this once every cell has finished (no Slurm needed, it is a plotting script):"
+fi
 echo "  $plot_cmd"
