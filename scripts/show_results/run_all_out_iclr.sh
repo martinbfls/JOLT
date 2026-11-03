@@ -23,12 +23,19 @@
 #   - compare_additive_warp.py
 #   - visualize_trigger.py (already invoked inline per-cell by the orchestrate_slurm scripts)
 #
-# Usage (from repo root, login-node shell -- submits one CPU-only sbatch job
-# and returns immediately; see $LOG_DIR/show_results_out_iclr.log for output):
+# Usage: submits one CPU-only sbatch job and returns immediately; see
+# $LOG_DIR/show_results_out_iclr.log for output.
 #   SLURM_ACCOUNT=<account> ./scripts/show_results/run_all_out_iclr.sh
-#   SLURM_ACCOUNT=<account> SLURM_PARTITION=pine_turin ./scripts/show_results/run_all_out_iclr.sh
+#   SLURM_ACCOUNT=<account> SLURM_PARTITION=pine ./scripts/show_results/run_all_out_iclr.sh
 #   MODEL=r32p DATASETS="cifar" TAGS="baseline eps_16_255" SLURM_ACCOUNT=<account> \
 #       ./scripts/show_results/run_all_out_iclr.sh
+#
+# maple_cpu (the default) belongs to the maple cluster: a submission from an
+# RDHPC login node is rejected ("You must submit your job from that
+# cluster's login node instead"), so run this script FROM maple-1 itself,
+# with this repo checked out there (e.g. `ssh maple-1`, cd into your own
+# clone of JOLT on that cluster's filesystem, then run this script) -- or
+# override SLURM_PARTITION=pine to submit from the RDHPC login node instead.
 ###
 
 set -euo pipefail
@@ -38,15 +45,7 @@ BASE_DIR="${BASE_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 export BASE_DIR
 cd "$BASE_DIR"
 
-# CPU-only partition. NOT maple_cpu/maple: those nodes belong to the maple
-# cluster and reject a submission coming from an RDHPC login node ("You must
-# submit your job from that cluster's login node instead") -- and that
-# cluster's login node (maple-1) doesn't have this repo checked out, so
-# routing sbatch through it (like slurm_lib.sh's PARTITION_HOSTS does for
-# plain "maple") isn't an option here either. `pine` is a large, no-GPU-
-# gated (GRES=null) partition reachable directly from the RDHPC login node,
-# with plenty of idle nodes -- see `sinfo`.
-SLURM_PARTITION="${SLURM_PARTITION:-pine}"
+SLURM_PARTITION="${SLURM_PARTITION:-maple_cpu}"
 GPUS_PER_TASK=0
 CPUS_PER_TASK="${CPUS_PER_TASK:-8}"
 MEM_PER_TASK="${MEM_PER_TASK:-16G}"
