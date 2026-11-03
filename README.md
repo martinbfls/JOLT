@@ -184,6 +184,25 @@ python scripts/show_results/plot_asr_per_seed.py --tags baseline eps_16_255
 python scripts/show_results/plot_asr_per_seed.py --campaign flip_frozen
 ```
 
+### Warp multi-budget campaign (ASR/CTA vs budget per variant)
+
+`scripts/show_results/plot_warp_multibudget.py` plots what
+`orchestrate_slurm/run_warp_multibudget_vs_multikrum_slurm.sh` produces: ASR and CTA vs flip
+budget on the federated deploy branch, mean +- std across seeds, one line per `VARIANT_TAG`.
+It writes `asr_cta_vs_budget.{png,pdf}` (both panels), the per-metric figures, a long-format
+`per_seed.csv` and a `summary.{md,csv}` table, and lists the cells that have no results yet:
+
+```bash
+python scripts/show_results/plot_warp_multibudget.py \
+    --variant-tags warp_s8_lpips0p0 warp_s16_lpips0p0 \
+    --seeds 0 1 2 3 4 --budgets 0 150 300 500 1000 2000 2500 5000
+python scripts/show_results/plot_warp_multibudget.py --per-seed   # each seed as a thin line too
+```
+
+Pass `--exp-root` to read another results tree (e.g. `experiments/out_iclr`), and
+`--deploy-agg-method`/`--deploy-num-poisoned`/`--deploy-num-honests` for a different deployment
+than the `multikrum_3vs7` default.
+
 ### Flip matrices (which class goes to which)
 
 `scripts/show_results/plot_flip_matrix.py` draws confusion-style matrices of the selected label flips
