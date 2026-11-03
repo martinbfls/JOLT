@@ -208,6 +208,31 @@ Pass `--exp-root` to read another results tree (e.g. `experiments/out_iclr`), an
 `--deploy-agg-method`/`--deploy-num-poisoned`/`--deploy-num-honests` for a different deployment
 than the `multikrum_3vs7` default.
 
+### ASR dynamics (did the backdoor survive, or just peak?)
+
+`scripts/show_results/analyze_asr_dynamics.py` reads the per-epoch series instead of the final
+value, to separate a backdoor that holds from one that spikes mid-run and is then unlearned:
+
+```bash
+python scripts/show_results/analyze_asr_dynamics.py \
+    --variant-tags hybrid_eps0p25_s8p0 hybrid_eps0p0627_s8p0 --seeds 0 1 2
+```
+
+It writes `asr_vs_epoch_<tag>_<branch>.{png,pdf}` (one panel per budget, ASR solid, CTA dashed,
+LR drops marked — detected from the run's own `lr` series, not assumed), `transience.{png,md,csv}`
+(peak vs final ASR per cell, flagging those that lose more than `--transient-threshold` points),
+a long-format `dynamics.csv`, and `diagnosis_<tag>_<branch>.{png,pdf}`, which puts ASR, train
+accuracy and `cos(poisoned, honest)` on one epoch axis.
+
+That last figure is the point. The victim trains on **clean images with flipped labels** (the
+trigger only ever reaches the ASR test set), so the flipped examples are label noise, and the two
+usual causes of a collapse leave different traces: ASR falling at an LR milestone *while train
+accuracy keeps climbing* points at the network memorizing the flips one by one instead of
+explaining them with the shared feature the trigger rides; ASR falling *together with* the
+gradient cosine points at the robust aggregator filtering the poisoned workers instead.
+`--branch both` (the default) reads the centralized deployment too — its aggregator is a no-op
+`mean`, so a collapse there rules the aggregator out.
+
 ### Flip matrices (which class goes to which)
 
 `scripts/show_results/plot_flip_matrix.py` draws confusion-style matrices of the selected label flips
