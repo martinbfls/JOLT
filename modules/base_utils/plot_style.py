@@ -53,6 +53,10 @@ METRICS = {
     "delta_drift_l2": (r"$\|\delta - \delta_{init}\|_2$", 1),
     "delta_sign_flip_rate": (r"Sign-flip rate of $\delta$", 1),
     "mtt_delta_grad_norm": (r"$\|\nabla_\delta \mathcal{L}_{MTT}\|_2$", 1),
+    # warp control grid (trigger_type='warp'/'hybrid'); displacements are in pixels
+    "warp_l2": (r"Warp grid $\|\cdot\|_2$ (px)", 1),
+    "warp_linf": (r"Warp grid $\|\cdot\|_\infty$ (px)", 1),
+    "mtt_warp_grad_norm": (r"$\|\nabla_{grid} \mathcal{L}_{MTT}\|_2$", 1),
     "reg_term": ("Label regularization", 1),
 }
 

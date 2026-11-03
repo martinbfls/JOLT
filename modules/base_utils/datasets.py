@@ -10,6 +10,10 @@ from pathlib import Path
 import subprocess
 import matplotlib.pyplot as plt
 
+# Re-exported here, next to pick_poisoner, for the runtime callers (generate_labels_trigger_joint):
+# it is defined in the torch-free gen_configs helper so the config generators can read it too.
+from modules.base_utils.gen_configs import POISONER_BY_TRIGGER_TYPE  # noqa: F401
+
 
 SVHN_TRANSFORM_NORMALIZE_MEAN = (0.4377, 0.4438, 0.4728)
 SVHN_TRANSFORM_NORMALIZE_STD = (0.1980, 0.2010, 0.1970)
@@ -430,6 +434,34 @@ class WarpPoisoner(Poisoner):
         return transforms.ToPILImage()(apply_warp(x_tensor, self.control_grid, self.s))
 
 
+class HybridPoisoner(Poisoner):
+    """The warp and the additive perturbation composed (trigger_type='hybrid'). `trigger` is the
+    dict saved by generate_labels_trigger_joint: {"delta" (C, H, W), "control_grid" (1, 2, k, k)
+    in pixels, "warp_k", "warp_s"}; the composition order lives in apply_trigger_raw."""
+    def __init__(self, trigger: dict):
+        self.perturbation = trigger["delta"].detach()
+        self.control_grid = trigger["control_grid"].detach()
+        self.k = trigger["warp_k"]
+        self.s = trigger["warp_s"]
+
+    def poison(self, x: Image.Image) -> Image.Image:
+        from modules.optimizing_trigger.utils import apply_trigger_raw  # local: utils imports this module
+
+        x_tensor = transforms.ToTensor()(x)  # [C, H, W]
+
+        delta = self.perturbation
+        if delta.shape[-2:] != x_tensor.shape[-2:]:
+            delta = F.interpolate(
+                delta.unsqueeze(0),
+                size=x_tensor.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)
+
+        poisoned_tensor = apply_trigger_raw(x_tensor, delta, self.control_grid, self.s)
+        return transforms.ToPILImage()(poisoned_tensor)
+
+
 class RandomPoisoner(Poisoner):
     def __init__(self, poisoners: Iterable[Poisoner]):
         self.poisoners = poisoners
@@ -537,13 +569,31 @@ def make_dataloader(
     return dataloader
 
 
-def _load_warp_trigger(delta):
-    """The "warp" flag takes the saved trigger dict (or a path to it) through the `delta` argument."""
-    assert delta is not None, "The saved trigger dict must be provided (as delta) for the warp poisoner."
+def _load_trigger_dict(delta, keys, flag):
+    """The "warp"/"hybrid" flags take the saved trigger dict (or a path to it) through the `delta`
+    argument; `keys` are the entries that dict must carry for this poisoner to rebuild the trigger."""
+    assert delta is not None, f"The saved trigger dict must be provided (as delta) for the {flag} poisoner."
     trigger = torch.load(delta) if isinstance(delta, str) else delta
-    if not (isinstance(trigger, dict) and {"control_grid", "warp_k", "warp_s"} <= trigger.keys()):
-        raise TypeError("warp poisoner expects a dict with control_grid, warp_k and warp_s (or a path to one)")
+    if not (isinstance(trigger, dict) and set(keys) <= trigger.keys()):
+        raise TypeError(f"{flag} poisoner expects a dict with {', '.join(keys)} (or a path to one)")
+    # A hybrid trigger carries every key the warp poisoner needs, so without this it would deploy
+    # under poisoner='warp' with its additive half silently dropped -- a wrong attack, not an error.
+    saved_type = trigger.get("trigger_type")
+    if saved_type is not None and POISONER_BY_TRIGGER_TYPE.get(saved_type) != flag:
+        raise TypeError(
+            f"{flag} poisoner got a trigger saved with trigger_type={saved_type!r}, which deploys "
+            f"with the {POISONER_BY_TRIGGER_TYPE.get(saved_type)!r} poisoner -- using it here would "
+            "silently drop part of the trigger."
+        )
     return trigger
+
+
+def _load_warp_trigger(delta):
+    return _load_trigger_dict(delta, ("control_grid", "warp_k", "warp_s"), "warp")
+
+
+def _load_hybrid_trigger(delta):
+    return _load_trigger_dict(delta, ("delta", "control_grid", "warp_k", "warp_s"), "hybrid")
 
 
 def pick_poisoner(poisoner_flag, dataset_flag, target_label, delta=None):
@@ -610,6 +660,9 @@ def pick_cifar_poisoner(poisoner_flag, delta=None):
 
     elif poisoner_flag == "warp":
         x_poisoner = WarpPoisoner(_load_warp_trigger(delta))
+
+    elif poisoner_flag == "hybrid":
+        x_poisoner = HybridPoisoner(_load_hybrid_trigger(delta))
     else:
         raise NotImplementedError()
 
@@ -667,7 +720,10 @@ def pick_tiny_imagenet_poisoner(poisoner_flag, delta=None):
 
     elif poisoner_flag == "warp":
         x_poisoner = WarpPoisoner(_load_warp_trigger(delta))
-        
+
+    elif poisoner_flag == "hybrid":
+        x_poisoner = HybridPoisoner(_load_hybrid_trigger(delta))
+
     else:
         raise NotImplementedError()
 

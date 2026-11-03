@@ -12,7 +12,7 @@ dataset = "string: {cifar, cifar_100, tiny_imagenet}. For CIFAR-10, CIFAR-100 an
 trainer = "string: {sgd, adam}. Specifies optimizer."
 source_label = "int: {0,1,...,9}. Specifies label to mimic."
 target_label = "int: {0,1,...,9}. Specifies label to attack."
-poisoner = "string: Form: {{1,2,3,9}xp, {1,2}xs, {1,4}xl}. Integer resembles number of attacks and string represents type."
+poisoner = "string: Form: {{1,2,3,9}xp, {1,2}xs, {1,4}xl}. Integer resembles number of attacks and string represents type. The optimized triggers generate_labels_trigger_joint saves are deployed with 'optimized' (trigger_type='additive'), 'warp' or 'hybrid' instead, each reading the .pt given by `delta` below (pick_poisoner, modules/base_utils/datasets.py)."
 
 [OPTIONAL]
 true_labels = "string. Path to input labels .npy files (slurm compatible)."
@@ -27,7 +27,7 @@ num_poisoned = "int: {0,1,...,infty}. Num of poisoned workers"
 budget = "int: {0,1,...,infty}. Flip budget"
 agg_method = "str: aggregation method. {mean, median, trmean, krum, multikrum} aggregate each parameter tensor separately (per-layer); {krum_full, multikrum_full, geomed} act on each worker's full flattened gradient (geomed = geometric median, smoothed Weiszfeld). See modules/base_utils/robust_agg.py. Default: mean."
 pre_agg = "str: {none, nnm}. Optional pre-aggregation applied to the workers' full gradients before agg_method: nnm = Nearest Neighbor Mixing (each gradient replaced by the mean of its n - num_poisoned nearest neighbors, itself included). Works with every agg_method. Default: none."
-delta = "str. path to optimized trigger"
+delta = "str. path to the optimized trigger .pt: a bare tensor for poisoner='optimized', the saved dict for 'warp'/'hybrid'."
 track_poison_selection = "bool. If true, tags each worker's examples with whether their label was flipped (via {budget}_idx_flipped.npy from federated_select_flips) and records, per aggregation step with agg_method in {multikrum, krum}, whether a poisoned worker's flipped-label gradient was selected. Written to output_dir/multikrum_poison_stats.json. Default: false."
 track_grad_proximity = "bool. Requires num_honests > 0 (skipped on single_user, num_honests=0 -- no honest worker to compare against). Independent of track_poison_selection, works for every agg_method. Per aggregation step, computes each worker's full-model gradient, averages it across honest vs. poisoned (last num_poisoned) workers, and measures cosine similarity / L2 distance between the two means. Per-epoch means append to output_dir/multikrum_poison_stats.json under 'grad_proximity' and log via ExperimentTracker as 'grad_cosine_sim_poisoned_honest' / 'grad_l2_dist_poisoned_honest' (auto-plotted). Default: true."
 wandb = "dict: {enabled: bool, project: str, entity: str (optional), mode: str {online, offline, disabled} (optional, default online), tags: list[str] (optional), group: str (optional), run_name: str (optional)}. If enabled=true, per-step metrics and the auto-generated loss-curve plots are also mirrored to Weights & Biases via modules/base_utils/experiment_tracker.py's ExperimentTracker. Absent or enabled=false (default): no W&B activity; local plots/metrics under experiments/<experiment_name>/{plots,logs}/<module_name>/ are produced either way."

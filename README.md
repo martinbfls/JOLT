@@ -60,6 +60,48 @@ python -m modules.generate_labels_trigger_joint.gen_configs_paper_main_campaign 
 python -m modules.generate_labels_trigger_joint.gen_configs_paper_main_campaign
 ```
 
+### Trigger mechanisms: additive, warp, hybrid
+
+`generate_labels_trigger_joint`'s `trigger_type` picks what the joint optimization actually
+optimizes (schema: `schemas/generate_labels_trigger_joint.toml`):
+
+- `additive` (default): the pixel perturbation `delta`, applied as `clamp(x + delta, 0, 1)` under
+  `||delta||_inf <= epsilon`.
+- `warp`: a WaNet-style control grid of pixel displacements, under `||control_grid||_inf <= warp_s`.
+- `hybrid`: **both, composed and optimized jointly** --
+  `clamp(apply_warp(x, control_grid, warp_s) + delta, 0, 1)`. The two are separate leaf variables in
+  one Adam, each with its own learning rate (`lr_delta`, `lr_warp`) and its own budget (`epsilon`,
+  `warp_s`); every term that reaches the trigger (the MTT matching term, `L_bd`, `L_joint`,
+  `L_lpips`, ...) backpropagates into both, so the optimization splits the perturbation between
+  them. The warp comes first, so the additive pattern lands unaltered on the warped image and
+  `epsilon` stays an exact `Linf` budget on it; zeroing either component reduces the trigger exactly
+  to the other type. The intended use is a **small `epsilon`** (the visible part) with the warp
+  carrying the rest -- the additive trigger's ASR at a budget it cannot reach alone.
+
+Each type is deployed with its own poisoner flag (`optimized` / `warp` / `hybrid`,
+`POISONER_BY_TRIGGER_TYPE` in `modules/base_utils/gen_configs.py`), which `gen_configs.py` writes
+into the `federated_train_user` configs for you. Per-component instrumentation is logged
+throughout: `delta_l2`/`delta_linf`/`mtt_delta_grad_norm` for the additive half,
+`warp_l2`/`warp_linf`/`mtt_warp_grad_norm` for the warp one.
+
+```bash
+# one cell, hybrid trigger with an 8/255 additive budget plus a 4px warp
+python -m modules.generate_labels_trigger_joint.gen_configs --single-cell \
+    --trigger-type hybrid --epsilon 0.0314 --warp-s 4.0 --exp-base-tag hybrid --budgets 1500
+
+# same, submitted on Slurm (centralized + multikrum deploy of the one trigger)
+TRIGGER_TYPE=hybrid EPSILON=0.0314 WARP_S=4.0 BUDGETS=1500 \
+    SLURM_ACCOUNT=<account> ./orchestrate_slurm/run_warp_test_vs_multikrum_slurm.sh
+
+# three-way A/B/C at a shared additive budget, then the side-by-side figure
+VARIANTS="additive warp hybrid" EPSILON=0.0314 WARP_S=4.0 BUDGETS=1500 \
+    SLURM_ACCOUNT=<account> ./orchestrate_slurm/compare_additive_warp_slurm.sh
+```
+
+`scripts/show_results/visualize_trigger.py --trigger-type hybrid` previews the composed image
+alongside each raw component (the normalized delta and the displacement field), and
+`compare_additive_warp.py --hybrid-dir ...` adds the hybrid run to the additive-vs-warp comparison.
+
 ### FLIP with a frozen JOLT trigger
 
 Re-runs the FLIP pipeline (`train_expert -> generate_labels -> federated_select_flips ->

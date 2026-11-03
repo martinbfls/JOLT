@@ -11,7 +11,7 @@ from pathlib import Path
 
 import toml
 
-from modules.base_utils.gen_configs import wandb_block
+from modules.base_utils.gen_configs import POISONER_BY_TRIGGER_TYPE, wandb_block
 from modules.base_utils.config_validation import (
     write_config,
     validate_config_file as validate_config,
@@ -78,8 +78,8 @@ LAMBDA_DELTA = 1.0
 # Weight for L_joint (clean-task loss over the WHOLE local batch, additive to delta.grad the
 # same way as L_bd); 0.0 (default) is a full no-op. See schemas/generate_labels_trigger_joint.toml.
 LAMBDA_JOINT = 0.0
-# Weight for a perceptual LPIPS penalty between clean and triggered images (works under both
-# trigger_type='additive' and 'warp'); 0.0 (default) is a full no-op. Requires the `lpips`
+# Weight for a perceptual LPIPS penalty between clean and triggered images (works under every
+# trigger_type); 0.0 (default) is a full no-op. Requires the `lpips`
 # package when > 0 (lazily imported by run_module.py, not a hard dependency otherwise).
 LAMBDA_LPIPS = 0.0
 
@@ -93,9 +93,11 @@ DELTA_MIN_FRAC = 0.00
 # "random" (unseeded global torch RNG).
 INIT = "stripe"
 
-# trigger_type (run_module.py): "additive" (default, optimizes the pixel delta) or "warp"
-# (WaNet-style learned control-grid warp, see schemas/generate_labels_trigger_joint.toml).
-# The warp_*/lr_warp knobs below are only used when TRIGGER_TYPE == "warp".
+# trigger_type (run_module.py): "additive" (default, optimizes the pixel delta), "warp"
+# (WaNet-style learned control-grid warp) or "hybrid" (both composed, optimized jointly -- the
+# additive half still under EPSILON/LR_DELTA, the warp half under the WARP_*/LR_WARP knobs below;
+# see schemas/generate_labels_trigger_joint.toml). The warp_*/lr_warp knobs are unused when
+# TRIGGER_TYPE == "additive"; EPSILON/LR_DELTA and the delta floors are unused under "warp".
 TRIGGER_TYPE = "additive"
 WARP_K = 4
 WARP_S = 1.0
@@ -256,6 +258,15 @@ def cell_name(model_flag, dataset, agg_method, seed):
     return f"{model_flag}/{dataset}/{NUM_POISONED}vs{NUM_HONESTS}/{agg_method}/seed{seed}"
 
 
+def _poisoner_for(trigger_type):
+    """train_user's poisoner flag for this trigger_type (see POISONER_BY_TRIGGER_TYPE)."""
+    if trigger_type not in POISONER_BY_TRIGGER_TYPE:
+        raise ValueError(
+            f"trigger_type must be one of {sorted(POISONER_BY_TRIGGER_TYPE)}, got {trigger_type!r}"
+        )
+    return POISONER_BY_TRIGGER_TYPE[trigger_type]
+
+
 def generate_federated_deploy(
     model_flag,
     dataset,
@@ -276,9 +287,7 @@ def generate_federated_deploy(
     depends on num_honests/num_poisoned, which differ between the single-user GEN deployment and
     this federated one). Returns (paths, trigger_path, trigger_exists)."""
     init = INIT if init is None else init
-    if trigger_type not in ("additive", "warp"):
-        raise ValueError(f"trigger_type must be 'additive' or 'warp', got {trigger_type!r}")
-    poisoner = "warp" if trigger_type == "warp" else "optimized"
+    poisoner = _poisoner_for(trigger_type)
 
     lr = LEARNING_RATE.get(model_flag, 0.1)
     wd = WEIGHT_DECAY.get(model_flag, 2e-4)
@@ -372,9 +381,7 @@ def generate_cell(
     warp_k = WARP_K if warp_k is None else warp_k
     warp_s = WARP_S if warp_s is None else warp_s
     lr_warp = LR_WARP if lr_warp is None else lr_warp
-    if trigger_type not in ("additive", "warp"):
-        raise ValueError(f"trigger_type must be 'additive' or 'warp', got {trigger_type!r}")
-    poisoner = "warp" if trigger_type == "warp" else "optimized"
+    poisoner = _poisoner_for(trigger_type)
     ckpt_subdir = f"{model_flag}_1xs" if checkpoint_tag is None else f"{model_flag}_1xs_{checkpoint_tag}"
 
     if CHECKPOINT_SAMPLING != INDIRECT_MODULE_CHECKPOINT_SAMPLING:
@@ -632,13 +639,24 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--trigger-type",
-        choices=["additive", "warp"],
+        choices=sorted(POISONER_BY_TRIGGER_TYPE),
         default=None,
-        help="override TRIGGER_TYPE: 'warp' uses a learned WaNet-style warp trigger instead of the additive delta",
+        help="override TRIGGER_TYPE: 'warp' uses a learned WaNet-style warp trigger instead of the "
+        "additive delta, 'hybrid' optimizes BOTH jointly (warp composed with the additive delta) -- "
+        "pair it with a small --epsilon, the warp then carries the rest of the perturbation",
     )
     parser.add_argument("--warp-k", type=int, default=None, help="override WARP_K (warp control-grid side)")
     parser.add_argument("--warp-s", type=float, default=None, help="override WARP_S (max warp displacement, px)")
     parser.add_argument("--lr-warp", type=float, default=None, help="override LR_WARP")
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=None,
+        help="override EPSILON (default 1.0): the additive component's Linf budget, in [0, 1] "
+        "intensity. The knob to shrink under --trigger-type hybrid (e.g. 0.0627 for 16/255, "
+        "0.0314 for 8/255); unused under --trigger-type warp.",
+    )
+    parser.add_argument("--lr-delta", type=float, default=None, help="override LR_DELTA (default 1e-2)")
     parser.add_argument("--lambda-bd", type=float, default=None, help="override LAMBDA_BD (default 2.0)")
     parser.add_argument(
         "--lambda-joint",
@@ -653,14 +671,14 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help="override LAMBDA_LPIPS (default 0.0/off): weight for a perceptual LPIPS penalty "
-        "between clean and triggered images. Works under both --trigger-type additive and warp. "
-        "Requires the `lpips` package installed in the conda env when > 0.",
+        "between clean and triggered images. Works under every --trigger-type (under hybrid it "
+        "measures the composed trigger). Requires the `lpips` package installed in the conda env when > 0.",
     )
     parser.add_argument(
         "--exp-base-tag",
         default=None,
         help="suffix appended to EXP_BASE's dir name (e.g. 'warp'), so a side-by-side run "
-        "(e.g. additive vs. warp) writes to a sibling experiments/ tree instead of colliding "
+        "(e.g. additive vs. warp vs. hybrid) writes to a sibling experiments/ tree instead of colliding "
         "on the same cell paths",
     )
     parser.add_argument(
@@ -727,6 +745,10 @@ if __name__ == "__main__":
         WARP_S = args.warp_s
     if args.lr_warp is not None:
         LR_WARP = args.lr_warp
+    if args.epsilon is not None:
+        EPSILON = args.epsilon
+    if args.lr_delta is not None:
+        LR_DELTA = args.lr_delta
     if args.lambda_bd is not None:
         LAMBDA_BD = args.lambda_bd
     if args.lambda_joint is not None:

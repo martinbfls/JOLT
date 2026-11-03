@@ -8,8 +8,8 @@
 # loss regularization term), then submits BOTH deployments of that one
 # trigger on Slurm so the two training regimes are directly comparable:
 #
-#   EXPERT -> GEN (trigger_type=warp, least-constrained) -+-> CENTRALIZED FLIPS -> CENTRALIZED USER (1 poisoned / 0 honest)
-#                                                          +-> FED_GEN (--deploy-federated) -> FEDERATED FLIPS -> FEDERATED USER (3 poisoned / 7 honest, multikrum)
+#   EXPERT -> GEN (trigger_type=$TRIGGER_TYPE, least-constrained) -+-> CENTRALIZED FLIPS -> CENTRALIZED USER (1 poisoned / 0 honest)
+#                                                                   +-> FED_GEN (--deploy-federated) -> FEDERATED FLIPS -> FEDERATED USER (3 poisoned / 7 honest, multikrum)
 #
 # FED_GEN is its own tiny Slurm job (not run at submission time): the
 # federated select_flips/train_user configs can only be generated once the
@@ -21,9 +21,17 @@
 #   SLURM_ACCOUNT=<account> DRY_RUN=1 ./orchestrate_slurm/run_warp_test_vs_multikrum_slurm.sh
 #   WARP_S=4.0 BUDGETS=1500 SLURM_ACCOUNT=<account> ./orchestrate_slurm/run_warp_test_vs_multikrum_slurm.sh
 #
-# VARIANT_TAG (default "warp") names this cell's experiments/out/checkpoints subtree AND its
-# Slurm job names -- override it (e.g. per sweep_warp_min_perturbation_slurm.sh cell) to run
-# several WARP_S/LAMBDA_LPIPS combos side by side without colliding on paths or job names.
+# TRIGGER_TYPE (default "warp") picks the trigger mechanism: "warp", "additive", or "hybrid"
+# (both composed, optimized jointly). Under "hybrid" the additive half's budget/learning rate
+# come from EPSILON/LR_DELTA (left to gen_configs.py's own defaults when unset) while the warp
+# half keeps WARP_S/WARP_K/LR_WARP -- the stealth point is a SMALL epsilon with the warp
+# carrying the rest of the perturbation:
+#   TRIGGER_TYPE=hybrid EPSILON=0.0314 WARP_S=4.0 BUDGETS=1500 \
+#       SLURM_ACCOUNT=<account> ./orchestrate_slurm/run_warp_test_vs_multikrum_slurm.sh
+#
+# VARIANT_TAG (default: TRIGGER_TYPE) names this cell's experiments/out/checkpoints subtree AND
+# its Slurm job names -- override it (e.g. per sweep_warp_min_perturbation_slurm.sh cell) to run
+# several WARP_S/EPSILON/LAMBDA_LPIPS combos side by side without colliding on paths or job names.
 ###
 
 set -euo pipefail
@@ -41,7 +49,8 @@ DATASET="${DATASET:-cifar}"
 SEED="${SEED:-0}"
 BUDGETS_SINGLE="${BUDGETS:-1500}"
 DRY_RUN="${DRY_RUN:-0}"
-VARIANT_TAG="${VARIANT_TAG:-warp}"
+TRIGGER_TYPE="${TRIGGER_TYPE:-warp}"
+VARIANT_TAG="${VARIANT_TAG:-$TRIGGER_TYPE}"
 
 # Least-constrained warp + rebalanced losses, per this test's spec.
 WARP_S="${WARP_S:-8.0}"
@@ -50,6 +59,9 @@ LR_WARP="${LR_WARP:-0.1}"
 LAMBDA_BD="${LAMBDA_BD:-1.0}"
 LAMBDA_JOINT="${LAMBDA_JOINT:-1.0}"
 LAMBDA_LPIPS="${LAMBDA_LPIPS:-0.0}"
+# Additive half (TRIGGER_TYPE=additive/hybrid); unset leaves gen_configs.py's own defaults.
+EPSILON="${EPSILON:-}"
+LR_DELTA="${LR_DELTA:-}"
 
 DEPLOY_NUM_POISONED="${DEPLOY_NUM_POISONED:-3}"
 DEPLOY_NUM_HONESTS="${DEPLOY_NUM_HONESTS:-7}"
@@ -65,7 +77,8 @@ EXP_BASE_REL="federated_experiments/threat_model_direct_trigger_joint_${VARIANT_
 CELL_REL="$EXP_BASE_REL/$MODEL_FLAG/$DATASET/1vs0/mean/seed$SEED"
 FED_DEPLOY_REL="$CELL_REL/${DEPLOY_AGG_METHOD}_${DEPLOY_NUM_POISONED}vs${DEPLOY_NUM_HONESTS}"
 
-echo "[PLAN] variant=$VARIANT_TAG warp_s=$WARP_S warp_k=$WARP_K lambda_bd=$LAMBDA_BD lambda_joint=$LAMBDA_JOINT lambda_lpips=$LAMBDA_LPIPS"
+echo "[PLAN] variant=$VARIANT_TAG trigger_type=$TRIGGER_TYPE warp_s=$WARP_S warp_k=$WARP_K lambda_bd=$LAMBDA_BD lambda_joint=$LAMBDA_JOINT lambda_lpips=$LAMBDA_LPIPS"
+echo "[PLAN] additive half: epsilon=${EPSILON:-<gen_configs default>} lr_delta=${LR_DELTA:-<gen_configs default>}"
 echo "[PLAN] model=$MODEL_FLAG dataset=$DATASET seed=$SEED budgets=$BUDGETS_SINGLE"
 echo "[PLAN] centralized (1vs0, mean) vs federated ($DEPLOY_AGG_METHOD, ${DEPLOY_NUM_POISONED}vs${DEPLOY_NUM_HONESTS})"
 
@@ -86,10 +99,12 @@ run_gen_configs_on_compute_node() {
 }
 
 echo "[GEN] regenerating the whole $VARIANT_TAG cell from scratch (train_expert, gen, centralized flips/user)..."
-GEN_ARGS=(--single-cell --trigger-type warp --exp-base-tag "$VARIANT_TAG"
+GEN_ARGS=(--single-cell --trigger-type "$TRIGGER_TYPE" --exp-base-tag "$VARIANT_TAG"
           --model-flag "$MODEL_FLAG" --dataset "$DATASET" --seed "$SEED" --budgets "$BUDGETS_SINGLE"
           --warp-s "$WARP_S" --warp-k "$WARP_K" --lr-warp "$LR_WARP"
           --lambda-bd "$LAMBDA_BD" --lambda-joint "$LAMBDA_JOINT" --lambda-lpips "$LAMBDA_LPIPS")
+[ -n "$EPSILON" ] && GEN_ARGS+=(--epsilon "$EPSILON")
+[ -n "$LR_DELTA" ] && GEN_ARGS+=(--lr-delta "$LR_DELTA")
 [ "$DRY_RUN" = "1" ] && GEN_ARGS+=(--dry-run)
 run_gen_configs_on_compute_node "${GEN_ARGS[@]}"
 
@@ -137,7 +152,7 @@ echo "[PHASE] GEN submitted -> barrier $gen_barrier"
 # ---------------------------------------------------------------------------
 VIZ_OUT="$CELL_REL/gen_labels_trigger_joint/trigger_preview.png"
 viz_cmd="python scripts/show_results/visualize_trigger.py --exp-base experiments/$EXP_BASE_REL"
-viz_cmd+=" --model-flag $MODEL_FLAG --dataset $DATASET --seed $SEED --trigger-type warp"
+viz_cmd+=" --model-flag $MODEL_FLAG --dataset $DATASET --seed $SEED --trigger-type $TRIGGER_TYPE"
 viz_cmd+=" --out experiments/$VIZ_OUT"
 VIZ_JOBS=("$viz_cmd|${VARIANT_TAG}_viz_${MODEL_FLAG}_${DATASET}_seed${SEED}")
 TIME_PER_TASK="00:05:00"
@@ -168,7 +183,7 @@ echo "[PHASE] CENTRALIZED USER submitted (${#CEN_USER_JOBS[@]} jobs)."
 # at submission time (the trigger doesn't exist yet on the login node).
 # ---------------------------------------------------------------------------
 fed_gen_cmd="python -m modules.generate_labels_trigger_joint.gen_configs --deploy-federated"
-fed_gen_cmd+=" --trigger-type warp --exp-base-tag $VARIANT_TAG --model-flag $MODEL_FLAG --dataset $DATASET --seed $SEED"
+fed_gen_cmd+=" --trigger-type $TRIGGER_TYPE --exp-base-tag $VARIANT_TAG --model-flag $MODEL_FLAG --dataset $DATASET --seed $SEED"
 fed_gen_cmd+=" --budgets '$BUDGETS_SINGLE' --deploy-num-poisoned $DEPLOY_NUM_POISONED"
 fed_gen_cmd+=" --deploy-num-honests $DEPLOY_NUM_HONESTS --deploy-agg-method $DEPLOY_AGG_METHOD"
 FED_GEN_JOBS=("$fed_gen_cmd|${VARIANT_TAG}_fed_gen_${MODEL_FLAG}_${DATASET}_seed${SEED}")
@@ -191,7 +206,7 @@ TIME_PER_TASK="$USER_TIME"
 submit_job_pool_slurm FED_USER_JOBS "${VARIANT_TAG}_fed_user_seed${SEED}" "afterok:$fed_flips_barrier" || exit 1
 echo "[PHASE] FEDERATED USER submitted (${#FED_USER_JOBS[@]} jobs)."
 
-echo "[DONE] warp least-constrained campaign submitted: centralized AND federated ($DEPLOY_AGG_METHOD) branches both queued off the same trigger."
+echo "[DONE] $TRIGGER_TYPE least-constrained campaign submitted: centralized AND federated ($DEPLOY_AGG_METHOD) branches both queued off the same trigger."
 echo "[COMPARE] once finished, compare:"
 echo "  trigger visual: experiments/$VIZ_OUT (ready right after GEN, before either branch finishes)"
 for budget in $BUDGETS_SINGLE; do

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Compares an additive-trigger run against a warp-trigger (WaNet-style) run produced by
-compare_additive_warp_slurm.sh: final ASR/CTA from each train_user's metrics.json, plus a
-figure with a clean sample, both poisoned versions, and (for warp) the raw displacement field.
+compare_additive_warp_slurm.sh -- and, with --hybrid-dir, against the hybrid (warp + additive)
+run too: final ASR/CTA from each train_user's metrics.json, plus a figure with a clean sample,
+each poisoned version, and the raw displacement field of every warp-bearing trigger.
 
 Usage (from repo root, with the JOLT conda env active):
   python scripts/show_results/compare_additive_warp.py \\
       --additive-dir experiments/federated_experiments/threat_model_direct_trigger_joint_additive \\
       --warp-dir experiments/federated_experiments/threat_model_direct_trigger_joint_warp \\
+      --hybrid-dir experiments/federated_experiments/threat_model_direct_trigger_joint_hybrid \\
       --model-flag r32p --dataset cifar --budget 1500 --seed 0 \\
       --out scripts/show_results/compare_additive_warp.png
 """
@@ -22,7 +24,11 @@ import matplotlib.pyplot as plt
 from torchvision import transforms
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from modules.base_utils.datasets import load_dataset, pick_poisoner  # noqa: E402
+from modules.base_utils.datasets import (  # noqa: E402
+    POISONER_BY_TRIGGER_TYPE,
+    load_dataset,
+    pick_poisoner,
+)
 
 SOURCE_LABEL = 9
 TARGET_LABEL = 4
@@ -60,6 +66,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--additive-dir", required=True, help="EXP_BASE of the additive run")
     ap.add_argument("--warp-dir", required=True, help="EXP_BASE of the warp run")
+    ap.add_argument(
+        "--hybrid-dir",
+        default=None,
+        help="EXP_BASE of the hybrid (warp + additive) run -- optional third variant",
+    )
     ap.add_argument("--model-flag", default="r32p")
     ap.add_argument("--dataset", default="cifar")
     ap.add_argument("--seed", type=int, default=0)
@@ -67,16 +78,20 @@ def main():
     ap.add_argument("--out", default="scripts/show_results/compare_additive_warp.png")
     args = ap.parse_args()
 
-    for label, exp_base, poisoner_flag in [
-        ("additive", args.additive_dir, "optimized"),
-        ("warp", args.warp_dir, "warp"),
-    ]:
+    variants = [
+        ("additive", "Additive trigger", args.additive_dir),
+        ("warp", "Warp trigger (WaNet-style)", args.warp_dir),
+    ]
+    if args.hybrid_dir:
+        variants.append(("hybrid", "Hybrid trigger (warp + additive)", args.hybrid_dir))
+
+    for trigger_type, _, exp_base in variants:
         train_user_dir = cell_dir(exp_base, args.model_flag, args.dataset, args.seed) / f"train_user_{args.budget}"
         cta, asr = load_metrics(train_user_dir)
         if cta is None:
-            print(f"[{label}] metrics not found yet at {train_user_dir}/logs/federated_train_user_metrics.json")
+            print(f"[{trigger_type}] metrics not found yet at {train_user_dir}/logs/federated_train_user_metrics.json")
         else:
-            print(f"[{label}] final CTA={cta:.2f}%  ASR={asr:.2f}%  (budget={args.budget})")
+            print(f"[{trigger_type}] final CTA={cta:.2f}%  ASR={asr:.2f}%  (budget={args.budget})")
 
     dataset_obj = load_dataset(args.dataset, train=True)
     indices = [i for i, (_, y) in enumerate(dataset_obj) if y == SOURCE_LABEL]
@@ -84,22 +99,21 @@ def main():
     clean_img, _ = dataset_obj[idx]
 
     panels = [("Clean", to_pil(clean_img))]
-    warp_field = None
-    for label, exp_base, poisoner_flag in [
-        ("Additive trigger", args.additive_dir, "optimized"),
-        ("Warp trigger (WaNet-style)", args.warp_dir, "warp"),
-    ]:
+    warp_fields = []  # (label, (1, 2, k, k) pixel displacements) per warp-bearing variant
+    for trigger_type, label, exp_base in variants:
         trig_path = trigger_path(exp_base, args.model_flag, args.dataset, args.seed)
         if not trig_path.exists():
             print(f"[{label}] trigger not found at {trig_path} -- skipping panel")
             continue
-        poisoner = pick_poisoner(poisoner_flag, args.dataset, TARGET_LABEL, delta=str(trig_path))
+        poisoner = pick_poisoner(
+            POISONER_BY_TRIGGER_TYPE[trigger_type], args.dataset, TARGET_LABEL, delta=str(trig_path),
+        )
         poisoned_img, _ = poisoner.poison((clean_img, SOURCE_LABEL))
         panels.append((label, to_pil(poisoned_img)))
-        if poisoner_flag == "warp":
-            warp_field = torch.load(trig_path)["control_grid"]  # (1, 2, k, k) pixel displacements
+        if trigger_type != "additive":
+            warp_fields.append((trigger_type, torch.load(trig_path)["control_grid"]))
 
-    n = len(panels) + (1 if warp_field is not None else 0)
+    n = len(panels) + len(warp_fields)
     fig, axes = plt.subplots(1, n, figsize=(4 * n, 4))
     if n == 1:
         axes = [axes]
@@ -107,11 +121,10 @@ def main():
         ax.imshow(img)
         ax.set_title(title)
         ax.axis("off")
-    if warp_field is not None:
-        ax = axes[-1]
+    for ax, (trigger_type, warp_field) in zip(axes[len(panels):], warp_fields):
         dx, dy = warp_field[0, 0].numpy(), warp_field[0, 1].numpy()
         ax.quiver(dx, -dy, angles="xy")
-        ax.set_title("Warp control grid (pixel displacement)")
+        ax.set_title(f"{trigger_type}: warp control grid (px)")
         ax.set_aspect("equal")
         ax.invert_yaxis()
 

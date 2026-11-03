@@ -238,11 +238,12 @@ def raw_to_preprocess(x_raw: torch.Tensor, dataset_flag: str, model_flag: str = 
 
 
 def raw_to_trigger_preprocess(x_raw: torch.Tensor, delta: torch.Tensor,
-                               dataset_flag: str, model_flag: str = None):
-    if x_raw.dim() == 3:
-        x_trig = (x_raw + delta).clamp(0, 1)
-    else:
-        x_trig = (x_raw + delta.unsqueeze(0)).clamp(0, 1)
+                               dataset_flag: str, model_flag: str = None,
+                               control_grid: torch.Tensor = None, s: float = 1.0):
+    """Preprocessed triggered images. `delta` (additive perturbation) and `control_grid` (warp
+    displacement field) are composed by apply_warp/apply_trigger_raw; either may be None, both
+    together give the hybrid trigger."""
+    x_trig = apply_trigger_raw(x_raw, delta, control_grid, s)
     return raw_to_preprocess(x_trig, dataset_flag, model_flag)
 
 
@@ -266,6 +267,27 @@ def apply_warp(x_raw: torch.Tensor, control_grid: torch.Tensor, s: float):
     return warped.squeeze(0) if squeeze else warped
 
 
+def apply_trigger_raw(x_raw: torch.Tensor, delta: torch.Tensor = None,
+                      control_grid: torch.Tensor = None, s: float = 1.0):
+    """The composed trigger in RAW [0, 1] space -- single source of truth for the composition
+    order, shared by the optimizer (generate_labels_trigger_joint), the LPIPS penalty and the
+    deploy-time poisoners (modules/base_utils/datasets.py):
+
+        clamp(apply_warp(x_raw, control_grid, s) + delta, 0, 1)
+
+    Either component may be None: `control_grid=None` gives the pure additive trigger
+    (trigger_type='additive'), `delta=None` the pure warp ('warp', apply_warp alone -- it needs
+    no clamp, grid_sample interpolating an in-range image stays in range), both the hybrid one
+    ('hybrid'). The warp comes FIRST so the additive pattern lands unaltered on top of the warped
+    image: ||.||_inf of the additive component in the final image is then exactly ||delta||_inf,
+    and each component zeroed out reduces the hybrid trigger exactly to the other one."""
+    x_trig = x_raw if control_grid is None else apply_warp(x_raw, control_grid, s)
+    if delta is not None:
+        x_trig = (x_trig + (delta if x_trig.dim() == 3 else delta.unsqueeze(0))).clamp(0, 1)
+    return x_trig
+
+
 def raw_to_warp_preprocess(x_raw: torch.Tensor, control_grid: torch.Tensor,
                            dataset_flag: str, model_flag: str = None, s: float = 1.0):
-    return raw_to_preprocess(apply_warp(x_raw, control_grid, s), dataset_flag, model_flag)
+    return raw_to_trigger_preprocess(x_raw, None, dataset_flag, model_flag,
+                                     control_grid=control_grid, s=s)

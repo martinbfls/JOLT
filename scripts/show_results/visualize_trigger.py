@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Visualizes ONE already-generated trigger: a clean sample, its poisoned version, and (for
-trigger_type="warp") the control grid's raw displacement field. Meant to run automatically
-right after the GEN phase (generate_labels_trigger_joint) in a Slurm pipeline.
+"""Visualizes ONE already-generated trigger: a clean sample, its poisoned version, and the raw
+components it is made of -- the control grid's displacement field (trigger_type="warp" and
+"hybrid") and the additive perturbation (trigger_type="hybrid", amplified so a small epsilon
+stays legible). Meant to run automatically right after the GEN phase
+(generate_labels_trigger_joint) in a Slurm pipeline.
 
 Usage (from repo root, with the JOLT conda env active):
   python scripts/show_results/visualize_trigger.py \\
@@ -20,7 +22,11 @@ import matplotlib.pyplot as plt
 from torchvision import transforms
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from modules.base_utils.datasets import load_dataset, pick_poisoner  # noqa: E402
+from modules.base_utils.datasets import (  # noqa: E402
+    POISONER_BY_TRIGGER_TYPE,
+    load_dataset,
+    pick_poisoner,
+)
 
 SOURCE_LABEL = 9
 TARGET_LABEL = 4
@@ -45,7 +51,7 @@ def main():
     ap.add_argument("--model-flag", default="r32p")
     ap.add_argument("--dataset", default="cifar")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--trigger-type", choices=["additive", "warp"], default="warp")
+    ap.add_argument("--trigger-type", choices=sorted(POISONER_BY_TRIGGER_TYPE), default="warp")
     ap.add_argument("--gen-agg-method", default="mean")
     ap.add_argument("--out", default=None, help="defaults to <module_dir>/trigger_preview.png")
     args = ap.parse_args()
@@ -62,23 +68,33 @@ def main():
     idx = np.random.RandomState(0).choice(indices)
     clean_img, _ = dataset_obj[idx]
 
-    poisoner_flag = "warp" if args.trigger_type == "warp" else "optimized"
-    poisoner = pick_poisoner(poisoner_flag, args.dataset, TARGET_LABEL, delta=str(trig_path))
+    poisoner = pick_poisoner(
+        POISONER_BY_TRIGGER_TYPE[args.trigger_type], args.dataset, TARGET_LABEL, delta=str(trig_path),
+    )
     poisoned_img, _ = poisoner.poison((clean_img, SOURCE_LABEL))
 
     panels = [("Clean", to_pil(clean_img)), (f"Poisoned ({args.trigger_type})", to_pil(poisoned_img))]
-    warp_field = None
-    if args.trigger_type == "warp":
-        warp_field = torch.load(trig_path)["control_grid"]  # (1, 2, k, k) pixel displacements
+    # 'additive' saves a bare tensor, 'warp'/'hybrid' the dict rebuilding each component
+    saved = torch.load(trig_path) if args.trigger_type != "additive" else None
+    warp_field = saved["control_grid"] if saved is not None else None  # (1, 2, k, k) pixel displacements
+    delta_field = saved.get("delta") if saved is not None else None  # (C, H, W), 'hybrid' only
 
-    n = len(panels) + (1 if warp_field is not None else 0)
+    n = len(panels) + (warp_field is not None) + (delta_field is not None)
     fig, axes = plt.subplots(1, n, figsize=(4 * n, 4))
     for ax, (title, img) in zip(axes, panels):
         ax.imshow(img)
         ax.set_title(title)
         ax.axis("off")
+    extra_axes = list(axes[len(panels):])
+    if delta_field is not None:
+        ax = extra_axes.pop(0)
+        # min-max normalized: a stealthy epsilon (e.g. 8/255) is invisible at true scale
+        d = delta_field.permute(1, 2, 0).numpy()
+        ax.imshow((d - d.min()) / max(d.max() - d.min(), 1e-12))
+        ax.set_title(f"Additive delta, normalized (||delta||_inf={float(delta_field.abs().max()):.4f})")
+        ax.axis("off")
     if warp_field is not None:
-        ax = axes[-1]
+        ax = extra_axes.pop(0)
         dx, dy = warp_field[0, 0].numpy(), warp_field[0, 1].numpy()
         ax.quiver(dx, -dy, angles="xy")
         ax.set_title(f"Warp control grid (max |disp|={float(warp_field.abs().max()):.2f}px)")

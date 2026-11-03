@@ -1,6 +1,7 @@
 """jointly optimizes poisoned logit labels (labels_syn)
 and a backdoor trigger (delta) via trajectory matching, with delta's gradient flowing
-through both the backdoor-efficacy term L_bd and the MTT trajectory-alignment term (param_loss)."""
+through both the backdoor-efficacy term L_bd and the MTT trajectory-alignment term (param_loss).
+The trigger is an additive perturbation, a WaNet-style warp, or both composed (trigger_type)."""
 
 from pathlib import Path
 import math
@@ -11,7 +12,12 @@ import warnings
 import torch
 import numpy as np
 
-from modules.base_utils.datasets import get_matching_datasets, pick_poisoner, get_n_classes
+from modules.base_utils.datasets import (
+    POISONER_BY_TRIGGER_TYPE,
+    get_matching_datasets,
+    pick_poisoner,
+    get_n_classes,
+)
 from modules.base_utils.util import (
     extract_toml,
     get_module_device,
@@ -43,7 +49,6 @@ from modules.optimizing_trigger.utils import (
     init_delta,
     init_warp_field,
     raw_to_trigger_preprocess,
-    raw_to_warp_preprocess,
     get_raw_clean_dataset,
     trigger_penalty,
     trigger_penalty_hinge,
@@ -72,6 +77,14 @@ def run(experiment_name, module_name, **kwargs):
     Optional add-ons (all off by default): live expert retraining, gradient-mismatch/
     aggregate-match penalties, an LPIPS penalty, and anti-collapse floors on delta's norm/
     alignment/margin/consistency.
+
+    trigger_type='hybrid' optimizes BOTH trigger mechanisms at once -- the additive delta under
+    ||delta||_inf <= epsilon AND the warp control grid under ||control_grid||_inf <= warp_s,
+    composed as clamp(apply_warp(x) + delta, 0, 1) -- as two leaf variables in one Adam (own
+    learning rate each), fed by the same objective. Every term that reaches the trigger (the MTT
+    matching term, L_bd, L_joint, L_lpips, ...) backpropagates into both components, so the
+    optimization is free to split the perturbation budget between them: the point is to reach the
+    additive trigger's ASR at a visibly smaller epsilon than it needs on its own.
 
     :param experiment_name: Name of the experiment in configuration.
     :param module_name: Name of the module in configuration.
@@ -136,15 +149,27 @@ def run(experiment_name, module_name, **kwargs):
         )
 
     trigger_type = args.get("trigger_type", "additive")
-    if trigger_type not in ("additive", "warp"):
-        raise ValueError(f"trigger_type must be 'additive' or 'warp', got {trigger_type!r}")
-    is_warp = trigger_type == "warp"
+    if trigger_type not in POISONER_BY_TRIGGER_TYPE:
+        raise ValueError(
+            f"trigger_type must be one of {sorted(POISONER_BY_TRIGGER_TYPE)}, got {trigger_type!r}"
+        )
+    # 'hybrid' optimizes both components at once, so it takes both budgets/learning rates and
+    # every additive-only term below (epsilon, the floors, the pixel penalties) applies to its
+    # additive half -- see this function's docstring.
+    is_hybrid = trigger_type == "hybrid"
+    has_additive = trigger_type in ("additive", "hybrid")
+    has_warp = trigger_type in ("warp", "hybrid")
     warp_k = args.get("warp_k", 4)
     warp_s = args.get("warp_s", 1.0)  # max displacement, in pixels
+    if has_warp:
+        # the control grid's own norms: a second figure, so the additive runs' trigger_norm one
+        # (delta_l2/delta_linf, the additive component under 'hybrid') stays comparable as-is
+        tracker.add_plot_group("warp_norm", ["warp_l2", "warp_linf"], ylabel="Warp control grid")
 
     epsilon = args.get("epsilon", 0.1)
-    # for the warp, the optimized variable (the control grid, in pixels) plays delta's role but lives on another scale
-    lr_delta = args.get("lr_warp", 1e-1) if is_warp else args.get("lr_delta", 1e-2)
+    lr_delta = args.get("lr_delta", 1e-2)
+    # the control grid lives in pixels, on a different scale than the additive delta in [0, 1]
+    lr_warp = args.get("lr_warp", 1e-1)
     lambda_bd = args.get("lambda_bd", 1.0)
     lambda_joint = args.get("lambda_joint", 0.0)
     track_joint = lambda_joint != 0
@@ -304,24 +329,31 @@ def run(experiment_name, module_name, **kwargs):
         )
     )
 
-    def apply_trigger(x_raw, d):
-        """Preprocessed triggered images for the optimized variable d (additive delta or warp control grid)."""
-        if is_warp:
-            return raw_to_warp_preprocess(
-                x_raw, d, dataset_flag=dataset_flag, model_flag=expert_model_flag, s=warp_s,
-            )
-        return raw_to_trigger_preprocess(x_raw, d, dataset_flag=dataset_flag, model_flag=expert_model_flag)
+    def apply_trigger(x_raw, d, cg):
+        """Preprocessed triggered images for the optimized variables: the additive delta `d` and
+        the warp control grid `cg` (each None when its component is off; see apply_trigger_raw)."""
+        return raw_to_trigger_preprocess(
+            x_raw, d, dataset_flag=dataset_flag, model_flag=expert_model_flag, control_grid=cg, s=warp_s,
+        )
 
-    def trigger_artifact(d):
-        """What is saved / handed to the poisoner: the bare tensor (additive) or the dict that rebuilds the warp."""
-        if is_warp:
-            return {"trigger_type": "warp", "control_grid": d.detach().cpu(), "warp_k": warp_k, "warp_s": warp_s}
-        return d.detach().cpu()
+    def trigger_artifact():
+        """What is saved / handed to the poisoner: the bare tensor (additive) or the dict that
+        rebuilds the warp ('warp') / both components ('hybrid')."""
+        if not has_warp:
+            return delta_add.detach().cpu()
+        artifact = {
+            "trigger_type": trigger_type,
+            "control_grid": warp_grid.detach().cpu(),
+            "warp_k": warp_k,
+            "warp_s": warp_s,
+        }
+        if has_additive:
+            artifact["delta"] = delta_add.detach().cpu()
+        return artifact
 
-    if is_warp:
-        delta = init_warp_field(warp_k, warp_s, device=device)
-    else:
-        delta = init_delta(
+    warp_grid = init_warp_field(warp_k, warp_s, device=device) if has_warp else None
+    delta_add = (
+        init_delta(
             mu.shape,
             horizontal=True,
             strength=6.0,
@@ -329,9 +361,34 @@ def run(experiment_name, module_name, **kwargs):
             device=device,
             init=init,
         )
+        if has_additive
+        else None
+    )
+    # `delta`: the variable every delta_*/cos_* metric and every pixel-space penalty below refers
+    # to -- the additive perturbation whenever there is one, the control grid under the warp-only
+    # trigger (where it is the single optimized variable, as before this file knew about 'hybrid').
+    delta = delta_add if has_additive else warp_grid
+    trigger_vars = [v for v in (delta_add, warp_grid) if v is not None]
+
+    def accumulate_trigger_grad(loss, weight, extra_targets=(), create_graph=False):
+        """Adds weight * dloss/dv into every trigger variable's own .grad -- the manual,
+        out-of-grand_loss path L_bd/L_joint/L_lpips take -- and returns dloss/d(extra_targets)."""
+        extra_targets = list(extra_targets)
+        grads = torch.autograd.grad(
+            loss,
+            trigger_vars + extra_targets,
+            retain_graph=True,
+            allow_unused=True,
+            create_graph=create_graph,
+        )
+        for v, g in zip(trigger_vars, grads):
+            if g is not None:
+                g_weighted = weight * g.detach()
+                v.grad = g_weighted if v.grad is None else v.grad + g_weighted
+        return grads[len(trigger_vars):]
 
     delta_min = None
-    if not is_warp:
+    if has_additive:
         max_reachable_l2 = epsilon * math.sqrt(delta.numel())
         delta_min = delta_min_frac * max_reachable_l2
         if delta_min > max_reachable_l2:
@@ -346,8 +403,16 @@ def run(experiment_name, module_name, **kwargs):
             f"{max_reachable_l2:.6f}); ||delta_init||_2 (raw, pre-clamp)="
             f"{delta.detach().norm().item():.6f}"
         )
-    delta.requires_grad_(True)
-    optimizer_delta = torch.optim.Adam([delta], lr=lr_delta)
+    for v in trigger_vars:
+        v.requires_grad_(True)
+    if is_hybrid:
+        # one Adam over both components, each with its own learning rate (they live on different
+        # scales: [0, 1] intensity for delta, pixels for the control grid)
+        optimizer_delta = torch.optim.Adam(
+            [{"params": [delta_add], "lr": lr_delta}, {"params": [warp_grid], "lr": lr_warp}]
+        )
+    else:
+        optimizer_delta = torch.optim.Adam([delta], lr=lr_warp if has_warp else lr_delta)
 
     batch_size, epochs, optimizer_expert, optimizer_labels = get_mtt_attack_info(
         expert_models[0].parameters(),
@@ -383,7 +448,12 @@ def run(experiment_name, module_name, **kwargs):
                 raw_poison_cache[i] = raw_train_dataset[i][0].to(device)
         return torch.stack([raw_poison_cache[i] for i in indices])
 
+    # Snapshots of the trigger as initialized, captured on the first step: delta_init feeds
+    # cos_delta_to_init/delta_drift_l2 (the primary variable), the two component snapshots feed
+    # the frozen-trigger ASR.
     delta_init = None
+    delta_add_init = None
+    warp_grid_init = None
     prev_delta_sign = None
 
     expert_pool = None
@@ -433,13 +503,17 @@ def run(experiment_name, module_name, **kwargs):
 
     retrain_base_dir = Path(output_dir).parent / "expert_retrain"
 
-    def _retrain_expert_with_trigger(round_idx, delta_snapshot, it, remaining_iterations):
+    def _retrain_expert_with_trigger(round_idx, it, remaining_iterations):
         nonlocal expert_starts, expert_opt_starts, expert_pool, pool_size, n_checkpoints_per_step
 
+        norms = []
+        if has_additive:
+            norms.append(f"||delta||_inf={delta_add.abs().max().item():.4f}")
+        if has_warp:
+            norms.append(f"||control_grid||_inf={warp_grid.abs().max().item():.4f}")
         print(
             f"[expert_retrain] round {round_idx}: retraining a fresh expert for "
-            f"{expert_retrain_epochs} epochs against the CURRENT trigger "
-            f"(||{'control_grid' if is_warp else 'delta'}||_inf={delta_snapshot.abs().max().item():.4f})..."
+            f"{expert_retrain_epochs} epochs against the CURRENT trigger ({', '.join(norms)})..."
         )
 
         if expert_retrain_agg_method != agg_method:
@@ -459,10 +533,10 @@ def run(experiment_name, module_name, **kwargs):
             torch.manual_seed(seed)
 
         poisoner = pick_poisoner(
-            trigger_type if is_warp else "optimized",
+            POISONER_BY_TRIGGER_TYPE[trigger_type],
             dataset_flag,
             target_label,
-            delta=trigger_artifact(delta_snapshot),
+            delta=trigger_artifact(),
         )
         poison_train, _, test, poison_test, _ = get_matching_datasets(
             dataset_flag,
@@ -561,7 +635,6 @@ def run(experiment_name, module_name, **kwargs):
                 expert_retrain_round += 1
                 _retrain_expert_with_trigger(
                     expert_retrain_round,
-                    delta,
                     it,
                     config["iterations"] - it,
                 )
@@ -647,7 +720,7 @@ def run(experiment_name, module_name, **kwargs):
                             if is_poisoned.any():
                                 idx_poisoned = idx[is_poisoned].tolist()
                                 x_raw_adv = _raw_poison_batch(idx_poisoned)
-                                x_trig = apply_trigger(x_raw_adv, delta)
+                                x_trig = apply_trigger(x_raw_adv, delta_add, warp_grid)
                                 x_t_adv = x_t.clone()
 
                                 x_t_adv[is_poisoned_dev] = x_trig
@@ -665,15 +738,7 @@ def run(experiment_name, module_name, **kwargs):
                                 expert_grad_buf[i].append(g)
 
                             if track_joint:
-                                joint_grad_raw = torch.autograd.grad(
-                                    loss_e,
-                                    [delta],
-                                    retain_graph=True,
-                                    allow_unused=True,
-                                )[0]
-                                if joint_grad_raw is not None:
-                                    joint_grad = (lambda_joint / n_checkpoints_per_step) * joint_grad_raw.detach()
-                                    delta.grad = joint_grad if delta.grad is None else delta.grad + joint_grad
+                                accumulate_trigger_grad(loss_e, lambda_joint / n_checkpoints_per_step)
                                 L_joint_sum = L_joint_sum + loss_e.detach()
                                 n_joint_valid += 1
 
@@ -703,21 +768,14 @@ def run(experiment_name, module_name, **kwargs):
                                     margin_sum = margin_sum + L_margin_cid
                                     margin_raw_sum = margin_raw_sum + margin_raw_cid.detach()
 
-                                grad_targets = [delta] + expert_params if track_poison_grad else [delta]
-
-                                bd_grads = torch.autograd.grad(
+                                expert_bd_grads = accumulate_trigger_grad(
                                     L_bd_cid,
-                                    grad_targets,
-                                    retain_graph=True,
-                                    allow_unused=True,
+                                    lambda_bd / n_checkpoints_per_step,
+                                    extra_targets=expert_params if track_poison_grad else (),
                                     create_graph=track_poison_grad,
                                 )
-                                delta_grad_raw = bd_grads[0]
-                                if delta_grad_raw is not None:
-                                    delta_grad = (lambda_bd / n_checkpoints_per_step) * delta_grad_raw.detach()
-                                    delta.grad = delta_grad if delta.grad is None else delta.grad + delta_grad
                                 if track_poison_grad:
-                                    for i, g in enumerate(bd_grads[1:]):
+                                    for i, g in enumerate(expert_bd_grads):
                                         if g is not None:
                                             poison_grad_chunks[i].append(g)
                                 L_bd_sum = L_bd_sum + L_bd_cid.detach()
@@ -727,17 +785,12 @@ def run(experiment_name, module_name, **kwargs):
 
                                 if lpips_model is not None:
                                     L_lpips_cid = lpips_penalty(
-                                        delta, x_raw_adv, lpips_model, is_warp=is_warp, warp_s=warp_s,
+                                        x_raw_adv, lpips_model, delta=delta_add,
+                                        control_grid=warp_grid, warp_s=warp_s,
                                     )
-                                    lpips_grad_raw = torch.autograd.grad(
-                                        L_lpips_cid,
-                                        [delta],
-                                        retain_graph=True,
-                                        allow_unused=True,
-                                    )[0]
-                                    if lpips_grad_raw is not None:
-                                        lpips_grad = (lambda_lpips / n_checkpoints_per_step) * lpips_grad_raw.detach()
-                                        delta.grad = lpips_grad if delta.grad is None else delta.grad + lpips_grad
+                                    accumulate_trigger_grad(
+                                        L_lpips_cid, lambda_lpips / n_checkpoints_per_step,
+                                    )
                                     L_lpips_sum = L_lpips_sum + L_lpips_cid.detach()
                                     n_lpips_valid += 1
                                     if do_balance:
@@ -818,9 +871,9 @@ def run(experiment_name, module_name, **kwargs):
                     margin_list.append(margin_sum / n_bd_valid if n_bd_valid > 0 else torch.tensor(0.0, device=device))
                     margin_raw_mean_list.append((margin_raw_sum / n_bd_valid).item() if n_bd_valid > 0 else 0.0)
 
-                L_bd_only_delta_grad = (
-                    delta.grad.detach().clone() if delta.grad is not None else torch.zeros_like(delta)
-                )
+                manual_only_grads = [
+                    v.grad.detach().clone() if v.grad is not None else torch.zeros_like(v) for v in trigger_vars
+                ]
 
                 reg_term = lam * torch.linalg.vector_norm(softmax(labels_syn) - labels_init, ord=1, dim=1).mean()
 
@@ -832,7 +885,7 @@ def run(experiment_name, module_name, **kwargs):
 
                 grand_loss = gamma_stealth * (mtt_term_avg + reg_term)
 
-                if not is_warp:  # pixel-delta penalties: undefined for the warp
+                if has_additive:  # pixel-delta penalties: undefined for the warp control grid
                     L_pen = trigger_penalty(delta, mu)
                     L_tv = tv_loss(delta)
                     grand_loss = grand_loss + (lambda_penalty * L_pen + lambda_delta * delta.norm() + lambda_tv * L_tv)
@@ -852,13 +905,21 @@ def run(experiment_name, module_name, **kwargs):
                 if do_balance:
 
                     def _grad_norm(term):
-                        g = torch.autograd.grad(
-                            term,
-                            delta,
-                            retain_graph=True,
-                            allow_unused=True,
-                        )[0]
-                        return g.norm().item() if g is not None else 0.0
+                        """||dterm/d(trigger)||_2 over every trigger variable at once (the two
+                        components' gradients concatenated under trigger_type='hybrid')."""
+                        grads = [
+                            g
+                            for g in torch.autograd.grad(
+                                term,
+                                trigger_vars,
+                                retain_graph=True,
+                                allow_unused=True,
+                            )
+                            if g is not None
+                        ]
+                        if not grads:
+                            return 0.0
+                        return torch.cat([g.reshape(-1) for g in grads]).norm().item()
 
                     g_main = _grad_norm(gamma_stealth * mtt_term_avg)
                     balance_targets = {
@@ -894,20 +955,27 @@ def run(experiment_name, module_name, **kwargs):
                 grand_loss.backward()
                 global_step += 1
 
-                mtt_delta_grad_norm = (
-                    (delta.grad.detach() - L_bd_only_delta_grad).norm().item() if delta.grad is not None else 0.0
-                )
+                # What grand_loss.backward() (the MTT matching term and the terms folded into it)
+                # added on top of the manually accumulated L_bd/L_joint/L_lpips gradients, per
+                # trigger variable: [0] is the primary one (delta), [-1] the warp control grid.
+                mtt_trigger_grad_norms = [
+                    (v.grad.detach() - g_manual).norm().item() if v.grad is not None else 0.0
+                    for v, g_manual in zip(trigger_vars, manual_only_grads)
+                ]
+                mtt_delta_grad_norm = mtt_trigger_grad_norms[0]
+                mtt_warp_grad_norm = mtt_trigger_grad_norms[-1] if has_warp else 0.0
 
                 optimizer_labels.step()
                 optimizer_delta.step()
 
                 with torch.no_grad():
-                    if is_warp:
-                        delta.clamp_(-warp_s, warp_s)
-                    elif trigger_constraint == "projection":
-                        delta.copy_(project_trigger_constraints(delta, mu, epsilon, align_kappa, delta_min))
-                    else:
-                        delta.clamp_(-epsilon, epsilon)
+                    if has_additive:
+                        if trigger_constraint == "projection":
+                            delta.copy_(project_trigger_constraints(delta, mu, epsilon, align_kappa, delta_min))
+                        else:
+                            delta.clamp_(-epsilon, epsilon)
+                    if has_warp:
+                        warp_grid.clamp_(-warp_s, warp_s)
 
                 for m in expert_models:
                     m.eval()
@@ -920,14 +988,16 @@ def run(experiment_name, module_name, **kwargs):
                 with torch.no_grad():
                     delta_l2 = delta.norm().item()
                     delta_linf = delta.abs().max().item()
-                    if is_warp:
-                        L_align_post = cos_target_post = cos_source_post = L_mag_post = 0.0
-                    else:
+                    warp_l2 = warp_grid.norm().item() if has_warp else 0.0
+                    warp_linf = warp_grid.abs().max().item() if has_warp else 0.0
+                    if has_additive:
                         L_align_post, cos_target_post = directional_floor_penalty(delta, mu, align_kappa)
                         cos_target_post, L_align_post = cos_target_post.item(), L_align_post.item()
                         cos_source_post = cosine_to(delta, mu_source).item()
                         L_mag_post, _ = magnitude_floor_penalty(delta, delta_min)
                         L_mag_post = L_mag_post.item()
+                    else:
+                        L_align_post = cos_target_post = cos_source_post = L_mag_post = 0.0
 
                     delta_sign = delta.sign()
                     if prev_delta_sign is None:
@@ -938,7 +1008,9 @@ def run(experiment_name, module_name, **kwargs):
 
                     just_captured = delta_init is None
                     if just_captured:
-                        delta_init = delta.detach().clone()
+                        delta_add_init = delta_add.detach().clone() if has_additive else None
+                        warp_grid_init = warp_grid.detach().clone() if has_warp else None
+                        delta_init = delta_add_init if has_additive else warp_grid_init
                     cos_to_init = cosine_to(delta, delta_init).item()
                     delta_drift_l2 = (delta - delta_init).norm().item()
                     if just_captured and delta_init.norm() > 0:
@@ -947,8 +1019,8 @@ def run(experiment_name, module_name, **kwargs):
                             f"delta_drift_l2={delta_drift_l2} -- expected exactly 1.0/0.0."
                         )
 
-                    x_trig_eval = apply_trigger(asr_eval_raw, delta)
-                    x_trig_eval_frozen = apply_trigger(asr_eval_raw, delta_init)
+                    x_trig_eval = apply_trigger(asr_eval_raw, delta_add, warp_grid)
+                    x_trig_eval_frozen = apply_trigger(asr_eval_raw, delta_add_init, warp_grid_init)
                     asr_mean_list = [
                         (m(x_trig_eval).argmax(dim=1) == target_label).float().mean().item() for m in expert_models
                     ]
@@ -981,6 +1053,8 @@ def run(experiment_name, module_name, **kwargs):
                     "delta_drift_l2": delta_drift_l2,
                     "delta_l2": delta_l2,
                     "delta_linf": delta_linf,
+                    "warp_l2": warp_l2,
+                    "warp_linf": warp_linf,
                     "cos_target": cos_target_post,
                     "cos_source": cos_source_post,
                     "L_align": L_align_post,
@@ -989,6 +1063,7 @@ def run(experiment_name, module_name, **kwargs):
                     "mag_active_rate": mag_active_rate,
                     "reg_term": reg_term.item(),
                     "mtt_delta_grad_norm": mtt_delta_grad_norm,
+                    "mtt_warp_grad_norm": mtt_warp_grad_norm,
                     "L_gradmatch": L_gradmatch_avg.item(),
                     "L_match": L_match_avg.item(),
                     "matching_term_std": float(np.std(matching_term_list)),
@@ -1010,25 +1085,29 @@ def run(experiment_name, module_name, **kwargs):
                 tracker.log(global_step, **step_metrics)
 
                 pbar.update(batch_size)
-                pbar.set_postfix(
-                    g_loss=f"{np.mean(losses[-20:]):.4g}",
-                    match=f"{matching_term:.4g}" if attack in ["backdoor"] else "N/A",
-                    L_bd=f"{L_bd_mean:.4g}",
-                    L_joint=f"{L_joint_mean:.4g}",
-                    expert_asr=f"{asr_mean:.4g}",
-                    asr_frozen=f"{asr_frozen_mean:.4g}",
-                    cos_init=f"{cos_to_init:.4g}",
-                    delta_linf=f"{delta_linf:.4g}",
-                    delta_l2=f"{delta_l2:.4g}",
-                    cos_tgt=f"{cos_target_post:.4g}",
-                    L_align=f"{L_align_post:.4g}",
-                    L_mag=f"{L_mag_post:.4g}",
-                    align_rate=f"{align_active_rate:.2f}",
-                    mag_rate=f"{mag_active_rate:.2f}",
-                    mtt_grad=f"{mtt_delta_grad_norm:.4g}",
-                    gradmatch=f"{L_gradmatch_avg.item():.4g}",
-                    agg_match=f"{L_match_avg.item():.4g}",
-                )
+                postfix = {
+                    "g_loss": f"{np.mean(losses[-20:]):.4g}",
+                    "match": f"{matching_term:.4g}" if attack in ["backdoor"] else "N/A",
+                    "L_bd": f"{L_bd_mean:.4g}",
+                    "L_joint": f"{L_joint_mean:.4g}",
+                    "expert_asr": f"{asr_mean:.4g}",
+                    "asr_frozen": f"{asr_frozen_mean:.4g}",
+                    "cos_init": f"{cos_to_init:.4g}",
+                    "delta_linf": f"{delta_linf:.4g}",
+                    "delta_l2": f"{delta_l2:.4g}",
+                    "cos_tgt": f"{cos_target_post:.4g}",
+                    "L_align": f"{L_align_post:.4g}",
+                    "L_mag": f"{L_mag_post:.4g}",
+                    "align_rate": f"{align_active_rate:.2f}",
+                    "mag_rate": f"{mag_active_rate:.2f}",
+                    "mtt_grad": f"{mtt_delta_grad_norm:.4g}",
+                    "gradmatch": f"{L_gradmatch_avg.item():.4g}",
+                    "agg_match": f"{L_match_avg.item():.4g}",
+                }
+                if is_hybrid:  # the warp half, alongside delta_linf/mtt_grad for the additive one
+                    postfix["warp_linf"] = f"{warp_linf:.4g}"
+                    postfix["mtt_warp_grad"] = f"{mtt_warp_grad_norm:.4g}"
+                pbar.set_postfix(**postfix)
 
     # Save results
     print("Saving results...")
@@ -1049,8 +1128,11 @@ def run(experiment_name, module_name, **kwargs):
     trig_path = (
         Path(output_dir_trigger) / f"opt_trig_direct_joint_{init}_{expert_model_flag}_{dataset_flag}_{run_tag}.pt"
     )
-    torch.save(trigger_artifact(delta), trig_path)
-    print(f"Saved trigger to {trig_path}")
+    torch.save(trigger_artifact(), trig_path)
+    print(
+        f"Saved trigger to {trig_path} (trigger_type={trigger_type}, deploy it with the "
+        f"{POISONER_BY_TRIGGER_TYPE[trigger_type]!r} poisoner flag)"
+    )
 
 
 if __name__ == "__main__":
