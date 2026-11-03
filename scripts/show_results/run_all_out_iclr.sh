@@ -3,7 +3,8 @@
 # run_all_out_iclr.sh
 #
 # Runs every show_results/*.py script that supports pointing at an arbitrary
-# results root, against experiments/out_iclr, in one command:
+# results root, against experiments/out_iclr, in one command, as a SINGLE
+# CPU-only Slurm job (these are plotting/table scripts -- no GPU needed):
 #   - plot_paper_main_campaign_user.py  (CTA-vs-ASR trade-off plots + LaTeX tables)
 #   - plot_asr_per_seed.py              (per-seed ASR/CTA scatter, variance visible)
 #   - plot_flip_matrix.py               (flip-selection confusion matrices)
@@ -22,63 +23,77 @@
 #   - compare_additive_warp.py
 #   - visualize_trigger.py (already invoked inline per-cell by the orchestrate_slurm scripts)
 #
-# Usage (from repo root, wherever experiments/out_iclr is readable -- login
-# node or a local clone with that directory rsynced down):
-#   ./scripts/show_results/run_all_out_iclr.sh
-#   MODEL=r32p DATASETS="cifar" TAGS="baseline eps_16_255" ./scripts/show_results/run_all_out_iclr.sh
+# Usage (from repo root, login-node shell -- submits one CPU-only sbatch job
+# and returns immediately; see $LOG_DIR/show_results_out_iclr.log for output):
+#   SLURM_ACCOUNT=<account> ./scripts/show_results/run_all_out_iclr.sh
+#   SLURM_ACCOUNT=<account> SLURM_PARTITION=pine ./scripts/show_results/run_all_out_iclr.sh
+#   MODEL=r32p DATASETS="cifar" TAGS="baseline eps_16_255" SLURM_ACCOUNT=<account> \
+#       ./scripts/show_results/run_all_out_iclr.sh
 ###
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${BASE_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+export BASE_DIR
 cd "$BASE_DIR"
+
+# CPU-only partition (see `sinfo`: maple_cpu is a dedicated no-GPU partition,
+# 4 idle nodes at submission time) -- no --gres requested below either way,
+# since GPUS_PER_TASK=0.
+SLURM_PARTITION="${SLURM_PARTITION:-maple_cpu}"
+GPUS_PER_TASK=0
+CPUS_PER_TASK="${CPUS_PER_TASK:-8}"
+MEM_PER_TASK="${MEM_PER_TASK:-16G}"
+TIME_PER_TASK="${TIME_PER_TASK:-00:30:00}"
+
+# shellcheck source=../../orchestrate_slurm/slurm_lib.sh
+source "$BASE_DIR/orchestrate_slurm/slurm_lib.sh"
 
 JOLT_ROOT="${JOLT_ROOT:-experiments/out_iclr}"
 MODEL="${MODEL:-r32p}"
 DATASETS="${DATASETS:-cifar}"
 TAGS="${TAGS:-baseline eps_16_255}"
 
-read -ra DATASETS_ARR <<< "$DATASETS"
-read -ra TAGS_ARR <<< "$TAGS"
-
 if [ ! -d "$JOLT_ROOT" ]; then
     echo "[ABORT] $JOLT_ROOT not found (rsync/mount it locally, or run this on the cluster)." >&2
     exit 1
 fi
 
-echo "[PLAN] jolt_root=$JOLT_ROOT model=$MODEL datasets=(${DATASETS_ARR[*]}) tags=(${TAGS_ARR[*]})"
+echo "[PLAN] partition=$SLURM_PARTITION jolt_root=$JOLT_ROOT model=$MODEL datasets=($DATASETS) tags=($TAGS)"
 
-echo
-echo "=== [1/4] plot_paper_main_campaign_user.py (CTA-vs-ASR trade-off + LaTeX tables) ==="
+preflight_slurm || exit 1
+
+CMD="set -euo pipefail
+echo '=== [1/4] plot_paper_main_campaign_user.py (CTA-vs-ASR trade-off + LaTeX tables) ==='
 python scripts/show_results/plot_paper_main_campaign_user.py \
-    --model "$MODEL" --datasets "${DATASETS_ARR[@]}" --tags "${TAGS_ARR[@]}" \
-    --jolt-root "$JOLT_ROOT" \
+    --model '$MODEL' --datasets $DATASETS --tags $TAGS \
+    --jolt-root '$JOLT_ROOT' \
     --out-dir ./plots_paper_main_campaign_user \
     --csv-dir ./results_csv_paper_main_campaign_user \
     --table-dir ./tables_paper_main_campaign_user
 
-echo
-echo "=== [2/4] plot_asr_per_seed.py (per-seed ASR/CTA scatter) ==="
+echo '=== [2/4] plot_asr_per_seed.py (per-seed ASR/CTA scatter) ==='
 python scripts/show_results/plot_asr_per_seed.py \
-    --campaign jolt --root "$JOLT_ROOT" --model "$MODEL" \
-    --datasets "${DATASETS_ARR[@]}" --tags "${TAGS_ARR[@]}" \
+    --campaign jolt --root '$JOLT_ROOT' --model '$MODEL' \
+    --datasets $DATASETS --tags $TAGS \
     --out-dir ./plots_per_seed
 
-echo
-echo "=== [3/4] plot_flip_matrix.py (flip-selection confusion matrices) ==="
+echo '=== [3/4] plot_flip_matrix.py (flip-selection confusion matrices) ==='
 python scripts/show_results/plot_flip_matrix.py \
-    --campaign jolt --root "$JOLT_ROOT" --model "$MODEL" \
-    --datasets "${DATASETS_ARR[@]}" --tags "${TAGS_ARR[@]}" \
+    --campaign jolt --root '$JOLT_ROOT' --model '$MODEL' \
+    --datasets $DATASETS --tags $TAGS \
     --out-dir ./plots_flip_matrix
 
-echo
-echo "=== [4/4] plot_trigger_grid.py (clean-vs-poisoned trigger grid) ==="
+echo '=== [4/4] plot_trigger_grid.py (clean-vs-poisoned trigger grid) ==='
 python scripts/show_results/plot_trigger_grid.py \
-    --models "$MODEL" --datasets "${DATASETS_ARR[@]}" --tags "${TAGS_ARR[@]}" \
-    --jolt-root "$JOLT_ROOT" \
+    --models '$MODEL' --datasets $DATASETS --tags $TAGS \
+    --jolt-root '$JOLT_ROOT' \
     --out-dir ./plots_trigger_grid
 
-echo
-echo "[DONE] outputs under ./plots_paper_main_campaign_user, ./plots_per_seed, ./plots_flip_matrix, ./plots_trigger_grid"
-echo "       (+ ./results_csv_paper_main_campaign_user, ./tables_paper_main_campaign_user)"
+echo '[DONE] outputs under ./plots_paper_main_campaign_user, ./plots_per_seed, ./plots_flip_matrix, ./plots_trigger_grid'
+echo '       (+ ./results_csv_paper_main_campaign_user, ./tables_paper_main_campaign_user)'
+"
+
+jobid=$(submit_job_slurm "$CMD" "show_results_out_iclr" "" "$SLURM_PARTITION") || exit 1
+echo "[SUBMIT] job $jobid submitted on partition $SLURM_PARTITION -> log: $LOG_DIR/show_results_out_iclr.log"
