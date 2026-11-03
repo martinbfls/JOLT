@@ -60,17 +60,18 @@ echo "[PLAN] reusing existing triggers per (variant_tag, seed) -- no EXPERT/GEN 
 run_gen_configs_on_compute_node() {
     srun -A "$SLURM_ACCOUNT" -p "$SLURM_PARTITION" \
         --cpus-per-task=2 --mem=4G --time="$GEN_CONFIGS_TIME" \
-        bash -c "
+        bash -c '
             set -euo pipefail
-            cd '$BASE_DIR'
+            cd "$0"
             unset PYTHONPATH PYTHONHOME || true
-            export PATH='$CONDA_ENV/bin:\$PATH'
-            if [ \"\$(command -v python)\" != '$CONDA_ENV/bin/python' ]; then
-                echo '[gen_configs] FATAL: python is '\"\$(command -v python)\"', expected $CONDA_ENV/bin/python' >&2
+            export PATH="$1/bin:$PATH"
+            if [ "$(command -v python)" != "$1/bin/python" ]; then
+                echo "[gen_configs] FATAL: python is $(command -v python), expected $1/bin/python" >&2
                 exit 1
             fi
-            python -m modules.generate_labels_trigger_joint.gen_configs $*
-        "
+            shift 1
+            python -m modules.generate_labels_trigger_joint.gen_configs "$@"
+        ' "$BASE_DIR" "$CONDA_ENV" "$@"
 }
 
 CELL_RELS=()
