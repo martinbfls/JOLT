@@ -171,8 +171,18 @@ def summarize(df, args):
             "asr_collapse": asr[peak_i] - asr[-1],
             "cta_final": g["cta"].to_numpy(float)[-1] if "cta" in g else np.nan,
         }
+        # Measured over the SAME window as the collapse (peak epoch -> last epoch), because what
+        # discriminates the two explanations is how these move WHILE the ASR falls, not their
+        # final level: train accuracy still rising means the flips are being memorized one by
+        # one; the gradient cosine falling means the aggregator is filtering the poisoned workers.
         for name in ("train_acc", "grad_cos"):
-            rec[f"{name}_final"] = g[name].to_numpy(float)[-1] if name in g and not g[name].isna().all() else np.nan
+            if name in g and not g[name].isna().all():
+                series = g[name].to_numpy(float)
+                rec[f"{name}_at_peak"], rec[f"{name}_final"] = series[peak_i], series[-1]
+            else:
+                rec[f"{name}_at_peak"] = rec[f"{name}_final"] = np.nan
+        rec["train_acc_rise"] = rec["train_acc_final"] - rec["train_acc_at_peak"]
+        rec["grad_cos_drop"] = rec["grad_cos_at_peak"] - rec["grad_cos_final"]
         rec["lr_drops"] = lr_drop_epochs(g)
         records.append(rec)
     return pd.DataFrame(records)
@@ -181,25 +191,26 @@ def summarize(df, args):
 def aggregate(per_seed, args):
     """mean/std across seeds, reindexed so every requested (tag, branch, budget) shows up."""
     cols = ["asr_final", "asr_peak", "epoch_peak", "asr_collapse", "cta_final",
-            "train_acc_final", "grad_cos_final"]
+            "train_acc_final", "train_acc_rise", "grad_cos_final", "grad_cos_drop"]
     agg = per_seed.groupby(["tag", "branch", "budget"])[cols].agg(["mean", "std", "count"])
     agg.columns = [f"{c}_{s}" for c, s in agg.columns]
     return agg.reset_index()
 
 
-def fmt(row, col, n_seeds):
+def fmt(row, col, n_seeds, digits=1):
     mean, std, count = row[f"{col}_mean"], row[f"{col}_std"], row[f"{col}_count"]
     if pd.isna(mean):
         return "--"
     std = 0.0 if pd.isna(std) else std
     flag = "" if count == n_seeds else f" (n={int(count)})"
-    return f"{mean:.1f} +/- {std:.1f}{flag}"
+    return f"{mean:.{digits}f} +/- {std:.{digits}f}{flag}"
 
 
 def write_table(agg, args, out_dir):
     n_seeds = len(args.seeds)
     header = ["tag", "branch", "budget", "ASR final (%)", "ASR peak (%)", "peak epoch",
-              "collapse (pts)", "CTA final (%)", "transient?"]
+              "collapse (pts)", "CTA final (%)", "train acc rise (pts)", "grad cos drop",
+              "transient?"]
     lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
     for _, row in agg.iterrows():
         collapse = row["asr_collapse_mean"]
@@ -208,7 +219,8 @@ def write_table(agg, args, out_dir):
             str(row["tag"]), str(row["branch"]), str(row["budget"]),
             fmt(row, "asr_final", n_seeds), fmt(row, "asr_peak", n_seeds),
             fmt(row, "epoch_peak", n_seeds), fmt(row, "asr_collapse", n_seeds),
-            fmt(row, "cta_final", n_seeds), flag,
+            fmt(row, "cta_final", n_seeds), fmt(row, "train_acc_rise", n_seeds),
+            fmt(row, "grad_cos_drop", n_seeds, digits=2), flag,
         ]) + " |")
     table = "\n".join(lines)
     (out_dir / "transience.md").write_text(table + "\n")
@@ -358,6 +370,10 @@ def main():
     print(table)
     print(f"\n[FLAG] 'transient' = peak ASR exceeds final ASR by more than "
           f"{args.transient_threshold:.0f} points, averaged over seeds.")
+    print("[READ] both extra columns are measured over the collapse window (peak epoch -> last): "
+          "'train acc rise' > 0 while the ASR falls = the flipped labels are being memorized "
+          "one by one; 'grad cos drop' > 0 = the aggregator is filtering the poisoned workers. "
+          "A collapse on the centralized branch too rules the aggregator out (its `mean` is a no-op).")
 
     if missing:
         print(f"\n[MISSING] {len(missing)} cell(s) with no results yet:")
