@@ -45,7 +45,9 @@ def trigger_path(exp_base, model_flag, dataset, seed, init="stripe"):
 
 def load_metrics(train_user_dir):
     """Reads logs/federated_train_user_metrics.json (ExperimentTracker's output); returns
-    (final_cta, final_asr) or (None, None) if the file/keys are missing (run not finished)."""
+    (final_cta, final_asr) in PERCENT, or (None, None) if the file/keys are missing (run not
+    finished). The tracker stores the raw [0, 1] accuracy -- plot_style.scale is applied at
+    plot time only -- hence the x100 here."""
     path = Path(train_user_dir) / "logs" / "federated_train_user_metrics.json"
     if not path.exists():
         return None, None
@@ -53,8 +55,8 @@ def load_metrics(train_user_dir):
         data = json.load(f)
     cta = data.get("cta", [])
     asr = data.get("asr", [])
-    final_cta = cta[-1]["value"] if cta else None
-    final_asr = asr[-1]["value"] if asr else None
+    final_cta = cta[-1]["value"] * 100 if cta else None
+    final_asr = asr[-1]["value"] * 100 if asr else None
     return final_cta, final_asr
 
 

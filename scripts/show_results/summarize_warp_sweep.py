@@ -22,8 +22,9 @@ import json
 
 
 def load_final(train_user_dir):
-    """Returns (cta, asr) final values from logs/federated_train_user_metrics.json, or
-    (None, None) if the file/keys are missing (run not finished)."""
+    """Returns (cta, asr) final values IN PERCENT from logs/federated_train_user_metrics.json,
+    or (None, None) if the file/keys are missing (run not finished). ExperimentTracker stores
+    the raw [0, 1] accuracy (plot_style.scale is applied at plot time only), hence the x100."""
     path = Path(train_user_dir) / "logs" / "federated_train_user_metrics.json"
     if not path.exists():
         return None, None
@@ -31,7 +32,7 @@ def load_final(train_user_dir):
         data = json.load(f)
     cta = data.get("cta", [])
     asr = data.get("asr", [])
-    return (cta[-1]["value"] if cta else None), (asr[-1]["value"] if asr else None)
+    return (cta[-1]["value"] * 100 if cta else None), (asr[-1]["value"] * 100 if asr else None)
 
 
 def unsanitize(token):

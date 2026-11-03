@@ -74,11 +74,12 @@ def read_final(run_dir):
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return np.nan, np.nan, None
-    # the tracker stores percentages already -- do NOT rescale
+    # ExperimentTracker stores the RAW value, i.e. the [0, 1] accuracy clf_eval returns
+    # (plot_style.scale is applied at plot time only) -- so this needs the same x100 as the .npy
     cta_log, asr_log = data.get("cta", []), data.get("asr", [])
     return (
-        cta_log[-1]["value"] if cta_log else np.nan,
-        asr_log[-1]["value"] if asr_log else np.nan,
+        cta_log[-1]["value"] * 100 if cta_log else np.nan,
+        asr_log[-1]["value"] * 100 if asr_log else np.nan,
         "json",
     )
 
