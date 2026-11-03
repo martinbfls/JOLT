@@ -23,19 +23,18 @@
 #   - compare_additive_warp.py
 #   - visualize_trigger.py (already invoked inline per-cell by the orchestrate_slurm scripts)
 #
-# Usage: submits one CPU-only sbatch job and returns immediately; see
-# $LOG_DIR/show_results_out_iclr.log for output.
+# Usage (from the RDHPC login node, repo root): submits one CPU-only sbatch
+# job and returns immediately; see $LOG_DIR/show_results_out_iclr.log for
+# output.
 #   SLURM_ACCOUNT=<account> ./scripts/show_results/run_all_out_iclr.sh
-#   SLURM_ACCOUNT=<account> SLURM_PARTITION=pine ./scripts/show_results/run_all_out_iclr.sh
 #   MODEL=r32p DATASETS="cifar" TAGS="baseline eps_16_255" SLURM_ACCOUNT=<account> \
 #       ./scripts/show_results/run_all_out_iclr.sh
 #
-# maple_cpu (the default) belongs to the maple cluster: a submission from an
-# RDHPC login node is rejected ("You must submit your job from that
-# cluster's login node instead"), so run this script FROM maple-1 itself,
-# with this repo checked out there (e.g. `ssh maple-1`, cd into your own
-# clone of JOLT on that cluster's filesystem, then run this script) -- or
-# override SLURM_PARTITION=pine to submit from the RDHPC login node instead.
+# NOT maple_cpu/maple: those nodes are aarch64 (GH200/Grace) and
+# $CONDA_ENV (flip_x86_64) only ships x86_64 binaries -- "cannot execute
+# binary file: Exec format error" there, not a partition-access problem.
+# `pine` is x86_64, no-GPU-gated (GRES=null), reachable directly from the
+# RDHPC login node, with plenty of idle nodes -- see `sinfo`.
 ###
 
 set -euo pipefail
@@ -45,7 +44,7 @@ BASE_DIR="${BASE_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 export BASE_DIR
 cd "$BASE_DIR"
 
-SLURM_PARTITION="${SLURM_PARTITION:-maple_cpu}"
+SLURM_PARTITION="${SLURM_PARTITION:-pine}"
 GPUS_PER_TASK=0
 CPUS_PER_TASK="${CPUS_PER_TASK:-8}"
 MEM_PER_TASK="${MEM_PER_TASK:-16G}"
