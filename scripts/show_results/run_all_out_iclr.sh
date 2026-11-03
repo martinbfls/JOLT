@@ -26,7 +26,7 @@
 # Usage (from repo root, login-node shell -- submits one CPU-only sbatch job
 # and returns immediately; see $LOG_DIR/show_results_out_iclr.log for output):
 #   SLURM_ACCOUNT=<account> ./scripts/show_results/run_all_out_iclr.sh
-#   SLURM_ACCOUNT=<account> SLURM_PARTITION=pine ./scripts/show_results/run_all_out_iclr.sh
+#   SLURM_ACCOUNT=<account> SLURM_PARTITION=pine_turin ./scripts/show_results/run_all_out_iclr.sh
 #   MODEL=r32p DATASETS="cifar" TAGS="baseline eps_16_255" SLURM_ACCOUNT=<account> \
 #       ./scripts/show_results/run_all_out_iclr.sh
 ###
@@ -38,10 +38,15 @@ BASE_DIR="${BASE_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 export BASE_DIR
 cd "$BASE_DIR"
 
-# CPU-only partition (see `sinfo`: maple_cpu is a dedicated no-GPU partition,
-# 4 idle nodes at submission time) -- no --gres requested below either way,
-# since GPUS_PER_TASK=0.
-SLURM_PARTITION="${SLURM_PARTITION:-maple_cpu}"
+# CPU-only partition. NOT maple_cpu/maple: those nodes belong to the maple
+# cluster and reject a submission coming from an RDHPC login node ("You must
+# submit your job from that cluster's login node instead") -- and that
+# cluster's login node (maple-1) doesn't have this repo checked out, so
+# routing sbatch through it (like slurm_lib.sh's PARTITION_HOSTS does for
+# plain "maple") isn't an option here either. `pine` is a large, no-GPU-
+# gated (GRES=null) partition reachable directly from the RDHPC login node,
+# with plenty of idle nodes -- see `sinfo`.
+SLURM_PARTITION="${SLURM_PARTITION:-pine}"
 GPUS_PER_TASK=0
 CPUS_PER_TASK="${CPUS_PER_TASK:-8}"
 MEM_PER_TASK="${MEM_PER_TASK:-16G}"
