@@ -26,6 +26,11 @@
 #   VARIANT_TAGS="warp_s8_lpips0p0 warp_s16_lpips0p0" SEEDS="0 1 2 3 4" \
 #       BUDGETS="0 150 300 500 1000 2000 2500 5000" \
 #       SLURM_ACCOUNT=<account> ./orchestrate_slurm/run_warp_multibudget_vs_multikrum_slurm.sh
+#
+# TRIGGER_TYPE (default "warp") must match what the cells were GENERATED with -- it selects the
+# deploy-time poisoner flag. For cells produced by TRIGGER_TYPE=hybrid:
+#   TRIGGER_TYPE=hybrid VARIANT_TAGS="hybrid_eps0p5_s8" SEEDS="0 1 2 3 4" \
+#       SLURM_ACCOUNT=<account> ./orchestrate_slurm/run_warp_multibudget_vs_multikrum_slurm.sh
 ###
 
 set -euo pipefail
@@ -42,6 +47,10 @@ MODEL_FLAG="${MODEL_FLAG:-r32p}"
 DATASET="${DATASET:-cifar}"
 GEN_AGG_METHOD="${GEN_AGG_METHOD:-mean}"
 VARIANT_TAGS="${VARIANT_TAGS:-warp_s8_lpips0p0 warp_s16_lpips0p0}"
+# Must match the trigger_type the cells were GENERATED with: it picks the deploy-time poisoner
+# flag written into the train_user configs. A mismatch is caught at load time (pick_poisoner
+# refuses a trigger whose saved trigger_type maps to another poisoner), not silently deployed.
+TRIGGER_TYPE="${TRIGGER_TYPE:-warp}"
 SEEDS="${SEEDS:-0 1 2 3 4}"
 BUDGETS="${BUDGETS:-0 150 300 500 1000 2000 2500 5000}"
 DEPLOY_NUM_POISONED="${DEPLOY_NUM_POISONED:-3}"
@@ -53,7 +62,7 @@ GEN_CONFIGS_TIME="${GEN_CONFIGS_TIME:-00:10:00}"
 FLIPS_TIME="${FLIPS_TIME:-00:10:00}"
 USER_TIME="${USER_TIME:-0-01:00:00}"
 
-echo "[PLAN] model=$MODEL_FLAG dataset=$DATASET variant_tags=($VARIANT_TAGS) seeds=($SEEDS) budgets=($BUDGETS)"
+echo "[PLAN] model=$MODEL_FLAG dataset=$DATASET trigger_type=$TRIGGER_TYPE variant_tags=($VARIANT_TAGS) seeds=($SEEDS) budgets=($BUDGETS)"
 echo "[PLAN] federated-only ($DEPLOY_AGG_METHOD, ${DEPLOY_NUM_POISONED}vs${DEPLOY_NUM_HONESTS}) -- centralized branch skipped"
 echo "[PLAN] reusing existing triggers per (variant_tag, seed) -- no EXPERT/GEN re-run."
 
@@ -92,7 +101,7 @@ for tag in $VARIANT_TAGS; do
         fi
 
         echo "[GEN] federated ($DEPLOY_AGG_METHOD) select_flips/train_user for tag=$tag seed=$seed, budgets=($BUDGETS)..."
-        FED_GEN_ARGS=(--deploy-federated --trigger-type warp --exp-base-tag "$tag"
+        FED_GEN_ARGS=(--deploy-federated --trigger-type "$TRIGGER_TYPE" --exp-base-tag "$tag"
                       --model-flag "$MODEL_FLAG" --dataset "$DATASET" --seed "$seed"
                       --gen-agg-method "$GEN_AGG_METHOD" --budgets "$BUDGETS"
                       --deploy-num-poisoned "$DEPLOY_NUM_POISONED" --deploy-num-honests "$DEPLOY_NUM_HONESTS"
