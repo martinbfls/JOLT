@@ -85,6 +85,11 @@ throughout: `delta_l2`/`delta_linf`/`mtt_delta_grad_norm` for the additive half,
 `warp_l2`/`warp_linf`/`mtt_warp_grad_norm` for the warp one.
 
 ```bash
+# the whole epsilon x seed grid, every budget, both deployments and the comparison figure,
+# in one command (see the script's header for the knobs)
+EPSILON_VALUES="0.5 0.0627" WARP_S_VALUES="8.0" SEEDS="0 1 2" \
+    SLURM_ACCOUNT=<account> ./orchestrate_slurm/sweep_hybrid_epsilon_slurm.sh
+
 # one cell, hybrid trigger with an 8/255 additive budget plus a 4px warp
 python -m modules.generate_labels_trigger_joint.gen_configs --single-cell \
     --trigger-type hybrid --epsilon 0.0314 --warp-s 4.0 --exp-base-tag hybrid --budgets 1500
