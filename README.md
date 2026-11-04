@@ -228,8 +228,20 @@ the exit status counts the failures.
 The four `out_iclr` scripts only read the `paper_main_campaign` tree layout, so rather than
 teaching them a second one, step 3 builds a **symlink view** of the campaign in that shape
 (`make_paper_layout_view.py` — no copying, rebuilt on every run) and the rest run against it with
-`--jolt-root`. Outputs: `vs_budget/`, `asr_dynamics/`, `paper_main_campaign_user/` (+ `tables/`,
-`results_csv/`), `per_seed/`, `flip_matrix/`, `trigger_grid/`.
+`--jolt-root`.
+
+Everything lands in one directory per campaign, split by the axes that identify a result:
+
+```
+$OUT_ROOT/<campaign>/<model>/<dataset>/<deploy branch>/
+    vs_budget/  asr_dynamics/  paper_main_campaign_user/  tables/  results_csv/
+    per_seed/   flip_matrix/   trigger_grid/              _paper_layout_view/
+```
+
+`CAMPAIGN` defaults to the variant tag (tags joined by `+` when there are several); set it
+explicitly when two runs share tags but differ some other way — a `SPLIT_BATCH=1` re-deploy, say
+— so they do not overwrite each other. `OUT_ROOT` defaults to
+`experiments/federated_experiments/campaign_results`, and the orchestrators pass both through.
 
 `sweep_hybrid_epsilon_slurm.sh` and `run_warp_multibudget_vs_multikrum_slurm.sh` both gate a
 final Slurm job on it, so a campaign produces its own detailed results without a second command.

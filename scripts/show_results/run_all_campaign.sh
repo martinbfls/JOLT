@@ -64,6 +64,22 @@ if [ -z "${VARIANT_TAGS// /}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# One directory per campaign, then the axes that identify a result:
+#   $OUT_ROOT/<campaign>/<model>/<dataset>/<deploy branch>/<step>/
+# CAMPAIGN defaults to the tag when a run covers one, to the tags joined by '+' otherwise;
+# name it yourself when two runs share tags but differ some other way (SPLIT_BATCH, say).
+# ---------------------------------------------------------------------------
+read -ra _TAGS_FOR_NAME <<< "$VARIANT_TAGS"
+if [ "${#_TAGS_FOR_NAME[@]}" -eq 1 ]; then
+    _default_campaign="${_TAGS_FOR_NAME[0]}"
+else
+    _default_campaign="$(IFS=+; echo "${_TAGS_FOR_NAME[*]}")"
+fi
+CAMPAIGN="${CAMPAIGN:-$_default_campaign}"
+DEPLOY_TAG="${DEPLOY_AGG_METHOD}_${DEPLOY_NUM_POISONED}vs${DEPLOY_NUM_HONESTS}"
+RESULTS_DIR="$OUT_ROOT/$CAMPAIGN/$MODEL_FLAG/$DATASET/$DEPLOY_TAG"
+
+# ---------------------------------------------------------------------------
 # Submit ourselves, unless already running inside an allocation (the gated job
 # the orchestrators submit, or an interactive srun) or told not to.
 # ---------------------------------------------------------------------------
@@ -84,13 +100,14 @@ if [ "$SUBMIT" = "1" ]; then
     self_cmd+=" SEEDS='$SEEDS' BUDGETS='$BUDGETS'"
     self_cmd+=" DEPLOY_AGG_METHOD=$DEPLOY_AGG_METHOD"
     self_cmd+=" DEPLOY_NUM_POISONED=$DEPLOY_NUM_POISONED DEPLOY_NUM_HONESTS=$DEPLOY_NUM_HONESTS"
-    self_cmd+=" OUT_ROOT='$OUT_ROOT' ./scripts/show_results/run_all_campaign.sh"
+    self_cmd+=" OUT_ROOT='$OUT_ROOT' CAMPAIGN='$CAMPAIGN'"
+    self_cmd+=" ./scripts/show_results/run_all_campaign.sh"
 
     GPUS_PER_TASK=0 CPUS_PER_TASK="${CPUS_PER_TASK:-4}" MEM_PER_TASK="${MEM_PER_TASK:-8G}" \
     TIME_PER_TASK="${TIME_PER_TASK:-00:20:00}" \
         job=$(submit_job_slurm "$self_cmd" "campaign_results" "${RESULTS_DEPENDENCY:-}" "$RESULTS_PARTITION") || exit 1
     echo "[SUBMIT] job $job on partition $RESULTS_PARTITION -> log: $LOG_DIR/campaign_results.log"
-    echo "[SUBMIT] results will land under $OUT_ROOT/{vs_budget,asr_dynamics}"
+    echo "[SUBMIT] results will land under $RESULTS_DIR/"
     exit 0
 fi
 
@@ -105,7 +122,8 @@ read -ra _REF_TAGS <<< "$REFERENCE_TAGS"
 PLOT_TAGS=("${_TAGS[@]}" ${_REF_TAGS[@]+"${_REF_TAGS[@]}"})
 
 echo "[PLAN] tags=(${_TAGS[*]}) references=(${_REF_TAGS[*]:-none}) seeds=(${_SEEDS[*]})"
-echo "[PLAN] exp_root=$EXP_ROOT out_root=$OUT_ROOT branch=${DEPLOY_AGG_METHOD}_${DEPLOY_NUM_POISONED}vs${DEPLOY_NUM_HONESTS}"
+echo "[PLAN] exp_root=$EXP_ROOT campaign=$CAMPAIGN branch=$DEPLOY_TAG"
+echo "[PLAN] results -> $RESULTS_DIR/"
 
 # Each step is allowed to fail (a campaign still running has cells missing, and one script's
 # abort must not hide the other's output); the exit status reports how many did.
@@ -116,21 +134,21 @@ echo "=== [1/2] plot_warp_multibudget.py (ASR/CTA vs budget) ==="
 "$PYTHON" scripts/show_results/plot_warp_multibudget.py \
     "${COMMON[@]}" --variant-tags "${PLOT_TAGS[@]}" \
     --seeds "${_SEEDS[@]}" --budgets "${_BUDGETS[@]}" \
-    --per-seed --out-dir "$OUT_ROOT/vs_budget" || { echo "[WARN] step 1 failed" >&2; failures=$((failures + 1)); }
+    --per-seed --out-dir "$RESULTS_DIR/vs_budget" || { echo "[WARN] step 1 failed" >&2; failures=$((failures + 1)); }
 
 echo
 echo "=== [2/6] analyze_asr_dynamics.py (per-epoch dynamics, both branches) ==="
 "$PYTHON" scripts/show_results/analyze_asr_dynamics.py \
     "${COMMON[@]}" --variant-tags "${_TAGS[@]}" \
     --seeds "${_SEEDS[@]}" --budgets "${_BUDGETS[@]}" \
-    --branch both --out-dir "$OUT_ROOT/asr_dynamics" || { echo "[WARN] step 2 failed" >&2; failures=$((failures + 1)); }
+    --branch both --out-dir "$RESULTS_DIR/asr_dynamics" || { echo "[WARN] step 2 failed" >&2; failures=$((failures + 1)); }
 
 # ---------------------------------------------------------------------------
 # The four run_all_out_iclr.sh visualizations. They only read the paper_main_campaign tree
 # layout, so they run against a symlink view of this campaign (see make_paper_layout_view.py)
 # rather than being taught a second layout.
 # ---------------------------------------------------------------------------
-VIEW="${VIEW:-$OUT_ROOT/paper_layout_view}"
+VIEW="${VIEW:-$RESULTS_DIR/_paper_layout_view}"
 echo
 echo "=== [3/6] make_paper_layout_view.py (symlink view for the out_iclr scripts) ==="
 if "$PYTHON" scripts/show_results/make_paper_layout_view.py \
@@ -145,8 +163,8 @@ if "$PYTHON" scripts/show_results/make_paper_layout_view.py \
     "$PYTHON" scripts/show_results/plot_paper_main_campaign_user.py \
         --model "$MODEL_FLAG" --datasets "$DATASET" --tags "${_TAGS[@]}" \
         --seeds "${_SEEDS[@]}" --jolt-root "$VIEW" \
-        --out-dir "$OUT_ROOT/paper_main_campaign_user" \
-        --csv-dir "$OUT_ROOT/results_csv" --table-dir "$OUT_ROOT/tables" \
+        --out-dir "$RESULTS_DIR/paper_main_campaign_user" \
+        --csv-dir "$RESULTS_DIR/results_csv" --table-dir "$RESULTS_DIR/tables" \
         || { echo "[WARN] step 4 failed" >&2; failures=$((failures + 1)); }
 
     echo
@@ -154,17 +172,17 @@ if "$PYTHON" scripts/show_results/make_paper_layout_view.py \
     "$PYTHON" scripts/show_results/plot_asr_per_seed.py \
         --campaign jolt --root "$VIEW" --model "$MODEL_FLAG" --datasets "$DATASET" \
         --tags "${_TAGS[@]}" --seeds "${_SEEDS[@]}" --budgets "${_BUDGETS[@]}" \
-        --out-dir "$OUT_ROOT/per_seed" || { echo "[WARN] plot_asr_per_seed failed" >&2; failures=$((failures + 1)); }
+        --out-dir "$RESULTS_DIR/per_seed" || { echo "[WARN] plot_asr_per_seed failed" >&2; failures=$((failures + 1)); }
     "$PYTHON" scripts/show_results/plot_flip_matrix.py \
         --campaign jolt --root "$VIEW" --model "$MODEL_FLAG" --datasets "$DATASET" \
         --tags "${_TAGS[@]}" --seeds "${_SEEDS[@]}" --budgets "${_BUDGETS[@]}" \
-        --out-dir "$OUT_ROOT/flip_matrix" || { echo "[WARN] plot_flip_matrix failed" >&2; failures=$((failures + 1)); }
+        --out-dir "$RESULTS_DIR/flip_matrix" || { echo "[WARN] plot_flip_matrix failed" >&2; failures=$((failures + 1)); }
 
     echo
     echo "=== [6/6] plot_trigger_grid.py (clean vs poisoned, one row per tag) ==="
     "$PYTHON" scripts/show_results/plot_trigger_grid.py \
         --models "$MODEL_FLAG" --datasets "$DATASET" --tags "${_TAGS[@]}" \
-        --jolt-root "$VIEW" --out-dir "$OUT_ROOT/trigger_grid" \
+        --jolt-root "$VIEW" --out-dir "$RESULTS_DIR/trigger_grid" \
         || { echo "[WARN] step 6 failed" >&2; failures=$((failures + 1)); }
 else
     echo "[WARN] no cell to build the view from -- steps 4-6 skipped" >&2
@@ -175,6 +193,6 @@ echo
 if [ "$failures" -gt 0 ]; then
     echo "[DONE] $failures step(s) failed (campaign still running? see their own output above)."
 else
-    echo "[DONE] results under $OUT_ROOT/"
+    echo "[DONE] results under $RESULTS_DIR/"
 fi
 exit "$failures"

@@ -78,7 +78,8 @@ DRY_RUN="${DRY_RUN:-0}"
 # READ, never re-run. Set to "" to plot the hybrid cells alone.
 read -ra REFERENCE_TAGS_ARR <<< "${REFERENCE_TAGS:-warp_s8_lpips0p0 warp_s16_lpips0p0}"
 
-SUMMARY_OUT="${SUMMARY_OUT:-experiments/federated_experiments/hybrid_epsilon_sweep_summary}"
+SUMMARY_OUT="${SUMMARY_OUT:-experiments/federated_experiments/campaign_results}"
+CAMPAIGN="${CAMPAIGN:-hybrid_epsilon_sweep}"
 # Partition for the final (CPU-only) plotting job. Defaults to the campaign's own partition once
 # slurm_lib.sh is sourced: `pine` accepts srun from an RDHPC node but REFUSES sbatch from one
 # ("You must submit your job from that cluster's login node instead"), and the figure job is
@@ -136,7 +137,7 @@ plot_cmd+=" MODEL_FLAG=$MODEL_FLAG DATASET=$DATASET"
 plot_cmd+=" SEEDS='${SEEDS_ARR[*]}' BUDGETS='${_BUDGETS_ARR[*]}'"
 plot_cmd+=" DEPLOY_AGG_METHOD=$DEPLOY_AGG_METHOD"
 plot_cmd+=" DEPLOY_NUM_POISONED=$DEPLOY_NUM_POISONED DEPLOY_NUM_HONESTS=$DEPLOY_NUM_HONESTS"
-plot_cmd+=" OUT_ROOT=$SUMMARY_OUT ./scripts/show_results/run_all_campaign.sh"
+plot_cmd+=" OUT_ROOT=$SUMMARY_OUT CAMPAIGN='$CAMPAIGN' ./scripts/show_results/run_all_campaign.sh"
 
 if [ "$DRY_RUN" = "1" ]; then
     echo "[SWEEP] DRY_RUN=1: skipping the final figure job. It would have run:"
@@ -158,7 +159,7 @@ plot_dep="afterok:$(join_job_ids "${ALL_FINAL_JOB_IDS[@]}")"
 if plot_job=$(GPUS_PER_TASK=0 CPUS_PER_TASK=4 MEM_PER_TASK=8G TIME_PER_TASK=00:15:00 \
         submit_job_slurm "$plot_cmd" "hybrid_sweep_results" "$plot_dep" "$SUMMARY_PARTITION"); then
     echo "[SWEEP] figure job $plot_job submitted on $SUMMARY_PARTITION, depends on ${#ALL_FINAL_JOB_IDS[@]} final jobs (afterok)"
-    echo "[SWEEP] once it completes: $SUMMARY_OUT/{vs_budget,asr_dynamics}/"
+    echo "[SWEEP] once it completes: $SUMMARY_OUT/$CAMPAIGN/$MODEL_FLAG/$DATASET/${DEPLOY_AGG_METHOD}_${DEPLOY_NUM_POISONED}vs${DEPLOY_NUM_HONESTS}/"
     echo "[SWEEP] a cell that fails leaves the figure job pending -- scancel it and run this by hand:"
 else
     echo "[SWEEP] the figure job could NOT be submitted -- the ${#ALL_FINAL_JOB_IDS[@]} campaign jobs above are unaffected." >&2

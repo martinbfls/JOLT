@@ -77,7 +77,10 @@ DRY_RUN="${DRY_RUN:-0}"
 GEN_CONFIGS_TIME="${GEN_CONFIGS_TIME:-00:10:00}"
 FLIPS_TIME="${FLIPS_TIME:-00:10:00}"
 USER_TIME="${USER_TIME:-0-01:00:00}"
-RESULTS_OUT="${RESULTS_OUT:-experiments/federated_experiments/warp_multibudget_summary}"
+RESULTS_OUT="${RESULTS_OUT:-experiments/federated_experiments/campaign_results}"
+# Names the results directory under RESULTS_OUT; defaults to the tag(s). Set it when two
+# re-deploys of the SAME cells must not overwrite each other (SPLIT_BATCH=1, say).
+CAMPAIGN="${CAMPAIGN:-}"
 # Same partition as the campaign: `pine` takes srun from an RDHPC node but refuses sbatch from one.
 RESULTS_PARTITION="${RESULTS_PARTITION:-}"
 
@@ -195,14 +198,16 @@ results_cmd="SUBMIT=0 VARIANT_TAGS='$VARIANT_TAGS' MODEL_FLAG=$MODEL_FLAG DATASE
 results_cmd+=" GEN_AGG_METHOD=$GEN_AGG_METHOD SEEDS='$SEEDS' BUDGETS='$BUDGETS'"
 results_cmd+=" DEPLOY_AGG_METHOD=$DEPLOY_AGG_METHOD"
 results_cmd+=" DEPLOY_NUM_POISONED=$DEPLOY_NUM_POISONED DEPLOY_NUM_HONESTS=$DEPLOY_NUM_HONESTS"
-results_cmd+=" OUT_ROOT=$RESULTS_OUT ./scripts/show_results/run_all_campaign.sh"
+results_cmd+=" OUT_ROOT=$RESULTS_OUT"
+[ -n "$CAMPAIGN" ] && results_cmd+=" CAMPAIGN='$CAMPAIGN'"
+results_cmd+=" ./scripts/show_results/run_all_campaign.sh"
 
 # Never fatal: the campaign is already queued, so losing the command would be the worst outcome.
 if results_job=$(GPUS_PER_TASK=0 CPUS_PER_TASK=4 MEM_PER_TASK=8G TIME_PER_TASK=00:15:00 \
         submit_job_slurm "$results_cmd" "warp_mb_results" \
         "afterok:$(join_job_ids "${USER_JOB_IDS[@]}")" "$RESULTS_PARTITION"); then
     echo "[PHASE] results job $results_job submitted on $RESULTS_PARTITION, gated on ${#USER_JOB_IDS[@]} train_user jobs"
-    echo "[PHASE] once it completes: $RESULTS_OUT/{vs_budget,asr_dynamics}/"
+    echo "[PHASE] once it completes: $RESULTS_OUT/${CAMPAIGN:-<tag>}/$MODEL_FLAG/$DATASET/${DEPLOY_AGG_METHOD}_${DEPLOY_NUM_POISONED}vs${DEPLOY_NUM_HONESTS}/"
     echo "[PHASE] a failed cell leaves it pending -- scancel it and run this by hand:"
 else
     echo "[PHASE] the results job could NOT be submitted -- the campaign jobs are unaffected." >&2
