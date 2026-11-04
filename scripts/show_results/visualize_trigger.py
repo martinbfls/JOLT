@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Visualizes ONE already-generated trigger: a clean sample, its poisoned version, and the raw
 components it is made of -- the control grid's displacement field (trigger_type="warp" and
-"hybrid") and the additive perturbation (trigger_type="hybrid", amplified so a small epsilon
-stays legible). Meant to run automatically right after the GEN phase
+"hybrid"), the additive perturbation (trigger_type="hybrid", amplified so a small epsilon
+stays legible), and, when the trigger carries them, the photometric map (color_trigger) and the
+contrast mask (contrast_mask_floor). Meant to run automatically right after the GEN phase
 (generate_labels_trigger_joint) in a Slurm pipeline.
 
 Usage (from repo root, with the JOLT conda env active):
@@ -78,8 +79,21 @@ def main():
     saved = torch.load(trig_path) if args.trigger_type != "additive" else None
     warp_field = saved["control_grid"] if saved is not None else None  # (1, 2, k, k) pixel displacements
     delta_field = saved.get("delta") if saved is not None else None  # (C, H, W), 'hybrid' only
+    # Optional components, absent from a trigger optimized without them.
+    color_params = saved.get("color_params") if saved is not None else None  # (3, 4) = [A | b]
+    mask_floor = (saved.get("contrast_mask_floor") if saved is not None else None) or None
 
-    n = len(panels) + (warp_field is not None) + (delta_field is not None)
+    # The perturbation actually deployed on this image, as a number: the headline epsilon is only
+    # an upper bound once the contrast mask reweights it, and the warp/color components do not
+    # show up in it at all.
+    clean_t = transforms.ToTensor()(clean_img)
+    pois_t = transforms.ToTensor()(to_pil(poisoned_img))
+    measured = (
+        f"measured on this image: ||x' - x||_inf={float((pois_t - clean_t).abs().max()):.4f}, "
+        f"||x' - x||_2={float((pois_t - clean_t).norm()):.3f}"
+    )
+
+    n = len(panels) + sum(c is not None for c in (delta_field, warp_field, color_params, mask_floor))
     fig, axes = plt.subplots(1, n, figsize=(4 * n, 4))
     for ax, (title, img) in zip(axes, panels):
         ax.imshow(img)
@@ -97,11 +111,44 @@ def main():
         ax = extra_axes.pop(0)
         dx, dy = warp_field[0, 0].numpy(), warp_field[0, 1].numpy()
         ax.quiver(dx, -dy, angles="xy")
-        ax.set_title(f"Warp control grid (max |disp|={float(warp_field.abs().max()):.2f}px)")
+        tv = float((np.abs(np.diff(warp_field[0].numpy(), axis=1)).sum()
+                    + np.abs(np.diff(warp_field[0].numpy(), axis=2)).sum()))
+        ax.set_title(
+            f"Warp control grid {tuple(warp_field.shape[-2:])}\n"
+            f"max |disp|={float(warp_field.abs().max()):.2f}px, TV={tv:.2f}px"
+        )
         ax.set_aspect("equal")
         ax.invert_yaxis()
+    if color_params is not None:
+        from modules.optimizing_trigger.utils import apply_color  # noqa: E402
 
-    fig.suptitle(f"{args.model_flag}/{args.dataset} seed{args.seed} -- {args.trigger_type} trigger")
+        ax = extra_axes.pop(0)
+        a_max, b_max = saved.get("color_a_max", 0.05), saved.get("color_b_max", 0.02)
+        # A neutral gray ramp through the map: the clearest way to see a 12-parameter color
+        # shift, which on a natural image is close to invisible by construction.
+        ramp = torch.linspace(0, 1, 64).view(1, 1, 64).expand(3, 16, 64)
+        both = torch.cat([ramp, apply_color(ramp, color_params, a_max, b_max)], dim=1)
+        ax.imshow(both.permute(1, 2, 0).numpy())
+        ax.axhline(16, color="white", linewidth=1)
+        ax.set_title(
+            f"Photometric map, gray ramp\ntop clean / bottom mapped, "
+            f"||A||_inf={float(color_params[:, :3].abs().max()):.4f}, "
+            f"||b||_inf={float(color_params[:, 3].abs().max()):.4f}"
+        )
+        ax.axis("off")
+    if mask_floor is not None:
+        from modules.optimizing_trigger.utils import contrast_mask  # noqa: E402
+
+        ax = extra_axes.pop(0)
+        w = contrast_mask(clean_t, saved.get("contrast_mask_ksize", 5), mask_floor)
+        im = ax.imshow(w[0].numpy(), cmap="viridis", vmin=0, vmax=1)
+        ax.set_title(f"Contrast mask on this image\n(floor={mask_floor}, mean={float(w.mean()):.3f})")
+        ax.axis("off")
+        fig.colorbar(im, ax=ax, fraction=0.046)
+
+    fig.suptitle(
+        f"{args.model_flag}/{args.dataset} seed{args.seed} -- {args.trigger_type} trigger\n{measured}"
+    )
     fig.tight_layout()
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=150)

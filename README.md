@@ -82,7 +82,68 @@ Each type is deployed with its own poisoner flag (`optimized` / `warp` / `hybrid
 `POISONER_BY_TRIGGER_TYPE` in `modules/base_utils/gen_configs.py`), which `gen_configs.py` writes
 into the `federated_train_user` configs for you. Per-component instrumentation is logged
 throughout: `delta_l2`/`delta_linf`/`mtt_delta_grad_norm` for the additive half,
-`warp_l2`/`warp_linf`/`mtt_warp_grad_norm` for the warp one.
+`warp_l2`/`warp_linf`/`warp_tv`/`mtt_warp_grad_norm` for the warp one.
+
+The composition itself lives in `modules/optimizing_trigger/compose.py`
+(`apply_trigger_raw` — single source of truth, shared by the optimizer, the LPIPS penalty and the
+deploy-time poisoners). That module imports torch and nothing else from the project, so
+`python scripts/check_trigger_composition.py` verifies it without a dataset or a checkpoint; CI
+runs it to guard the guarantee that every knob below, at its default, leaves the composition
+bit-identical to what produced the results already on disk.
+
+### Stealth knobs: warp smoothness, EOT, photometric map, contrast masking
+
+Four further knobs buy expressivity or signal at (near) zero compute, all **off by default** so
+existing campaigns stay comparable:
+
+- `lambda_tv_warp`: total variation of the **warp control grid** (`lambda_tv` only ever applied to
+  the additive delta). Perceived warp visibility tracks how fast the displacement field *varies*,
+  not its amplitude, so `warp_s` alone is a poor visibility handle and leaves `warp_k` pinned at
+  its 32-DOF default. This term is what makes a larger `warp_k` (128 DOF at k=8, 512 at k=16)
+  usable at a **smaller** `warp_s` — the campaigns' `warp_s=8` on 32x32 images is ~16x WaNet's
+  own displacement budget at the same `warp_k=4`.
+- `eot_augment`: one draw of the **victim's** train-time augmentation (`RandomCrop(32, padding=4)`
+  + `RandomHorizontalFlip`) applied to the composed triggered image. The matched experts were
+  trained on triggered images *under* that augmentation while the optimization loop fed them
+  un-augmented ones. Costs no extra forward pass, and matters most for the warp, which a flip
+  mirrors (`(dx, dy) -> (-dx, dy)`).
+- `color_trigger`: a **third mechanism**, a global 3x4 affine photometric map (12 parameters,
+  budgets `color_a_max`/`color_b_max`). Perceptually cheap, and spatially uniform — hence
+  invariant to the victim's crops and flips.
+- `contrast_mask_floor`: makes the additive budget **per-pixel**, proportional to local contrast,
+  so `epsilon` is spent where the perturbation hides rather than uniformly (a flat sky costs as
+  much budget as a texture but shows far more). Zero extra parameters; the weight stays `<= 1`, so
+  `epsilon` remains a valid bound on the deployed perturbation.
+
+`color_trigger` and `contrast_mask_floor` require `--trigger-type hybrid`: they are carried by the
+hybrid artifact's dict and rebuilt by `HybridPoisoner`, so under any other type they would be
+optimized and then silently dropped (both `gen_configs.py` and `run_module.py` refuse instead).
+Older saved triggers deploy unchanged — the poisoner's fallbacks are these knobs' "off" values.
+
+**What more trigger expressivity can and cannot do.** At deploy time `federated_train_user` builds
+each worker's dataset from **clean images with flipped labels**; the trigger only ever reaches the
+ASR test set. The robust aggregator therefore never sees a triggered gradient, and no trigger —
+however expressive — evades Krum directly. The only indirect path is a trigger that needs *fewer
+flips* to be induced, which leaves the poisoned clients' gradients closer to the honest ones. So
+read these knobs at the **low** budgets, and spend expressivity on directions that are
+perceptually cheap yet simple enough in feature space for label flips on clean data to reproduce.
+`scripts/show_results/diagnose_trigger_capacity.py` (below) is what tells you which regime you are
+actually in.
+
+```bash
+# the ablation: base -> +warp TV/k8 -> +EOT -> +contrast mask -> +photometric map,
+# every variant from scratch, both deployments, then the verdict and the Pareto table.
+# REFERENCE_TAGS brings an existing campaign into the same comparison and backfills
+# whatever it never ran (no EXPERT/GEN re-run, no finished cell recomputed);
+# SPLIT_BATCH=1 is the convention to use for anything reported (see below).
+SPLIT_BATCH=1 EPSILON=0.0627 REFERENCE_TAGS="hybrid_eps0p0627_s8p0" \
+    SLURM_ACCOUNT=<account> ./orchestrate_slurm/ablate_trigger_stealth_slurm.sh
+```
+
+Budget 0 is in the default budget list as a **control**, not as a data point: with no label
+flipped, whatever ASR the trigger reaches there is the trigger acting as a plain adversarial
+perturbation rather than an induced backdoor. The diagnosis below reports every other budget net
+of it, and variants must be ranked on that net figure.
 
 ```bash
 # the whole epsilon x seed grid, every budget, both deployments and the comparison figure,
@@ -260,6 +321,41 @@ off by default — turning it on changes every federated number, so a campaign m
 conventions. Pass `--split-batch-across-workers` to `gen_configs.py`, or `SPLIT_BATCH=1` to the
 Slurm orchestrators; send its results to their own `RESULTS_OUT`, since they are not comparable
 with a cell's existing ones.
+
+### Which bottleneck? (trigger capacity vs. inducibility vs. aggregation)
+
+`scripts/show_results/diagnose_trigger_capacity.py` puts three ASRs side by side and names the
+bottleneck, because the three call for opposite work and the deployed ASR alone cannot tell them
+apart:
+
+| measurement | what it is | what it bounds |
+|---|---|---|
+| trigger ceiling | `expert_asr` / `retrain_expert_asr` from the GEN phase — an expert trained **with** triggered images | how well this perturbation can backdoor this architecture at all |
+| centralized ASR | the `1vs0`/`mean` branch, i.e. a no-op aggregator | whether the **label flips** can reproduce the trigger's feature at that budget |
+| federated ASR | the real `multikrum_3vs7` deployment | what the aggregator leaves |
+
+A low ceiling — and only that — means the trigger itself is the bottleneck and capacity is worth
+adding. A large ceiling-to-centralized gap is an **inducibility** failure: more expressivity makes
+it worse, since a more complex perturbation is harder for label flips to reproduce, not easier. A
+large centralized-to-federated gap is an **aggregation** failure, where the levers are the flip
+budget and `lambda_gradmatch`/`lambda_match`/`lambda_consistency`, never the trigger.
+
+`scripts/show_results/measure_trigger_stealth.py` is the other half: it rebuilds each saved trigger
+with its real poisoner, applies it to source-class test images, and measures LPIPS/SSIM/PSNR/Linf
+of the perturbation **as deployed** (the PIL round-trip included, so 1/255 quantization counts),
+then joins that with ASR and draws the Pareto view. `epsilon` cannot rank these variants — it
+bounds the additive half only, says nothing about a warp or a photometric map, and is merely an
+upper bound once `contrast_mask_floor` is on.
+
+```bash
+python scripts/show_results/diagnose_trigger_capacity.py \
+    --variant-tags ablate_base ablate_tv --seeds 0 1 2 --budgets 150 500 1500
+python scripts/show_results/measure_trigger_stealth.py \
+    --variant-tags ablate_base ablate_tv --seeds 0 1 2 --budgets 150 500 1500
+
+# both of the above, plus vs-budget, ASR dynamics and the campaign figures, in one command
+SEEDS="0 1 2" BUDGETS="150 500 1500" ./scripts/show_results/analyze_trigger_ablation.sh
+```
 
 ### ASR dynamics (did the backdoor survive, or just peak?)
 

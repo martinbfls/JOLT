@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from modules.base_utils.datasets import MTTDataset
 from modules.federated_generate_labels.utils import DEFAULT_EXPERT_CONFIG
+from modules.optimizing_trigger.compose import apply_trigger_raw
 
 
 def build_expert_pool(expert_starts, expert_opt_starts, pool_size):
@@ -161,14 +162,18 @@ def poison_consistency(poison_grad_chunks, eps=1e-8):
     return 1.0 - F.cosine_similarity(G, g_bar.unsqueeze(0).expand_as(G), dim=1, eps=eps).mean()
 
 
-def lpips_penalty(x_raw_clean, lpips_model, delta=None, control_grid=None, warp_s=1.0):
+def lpips_penalty(x_raw_clean, lpips_model, delta=None, control_grid=None, warp_s=1.0,
+                  **trigger_kwargs):
     """Perceptual (LPIPS) distance between the clean raw image(s) and their triggered counterpart,
     differentiable w.r.t. whichever trigger variables are passed: the pixel delta under
     trigger_type='additive', the warp control grid under 'warp', both composed under 'hybrid'
-    (see apply_trigger_raw, modules/optimizing_trigger/utils.py, for the composition)."""
-    from modules.optimizing_trigger.utils import apply_trigger_raw
+    (see apply_trigger_raw, modules/optimizing_trigger/utils.py, for the composition).
 
-    x_trig_raw = apply_trigger_raw(x_raw_clean, delta, control_grid, warp_s)
+    `trigger_kwargs` forwards apply_trigger_raw's optional components (the photometric map, the
+    contrast-masked additive budget) so the penalty always measures the trigger as DEPLOYED and
+    each optimized component receives its gradient. It is deliberately computed on the
+    un-augmented pair: visibility is a property of the trigger, not of the victim's augmentation."""
+    x_trig_raw = apply_trigger_raw(x_raw_clean, delta, control_grid, warp_s, **trigger_kwargs)
     x_clean_scaled = x_raw_clean * 2 - 1
     x_trig_scaled = x_trig_raw * 2 - 1
     return lpips_model(x_trig_scaled, x_clean_scaled).mean()

@@ -14,6 +14,12 @@ import matplotlib.pyplot as plt
 # it is defined in the torch-free gen_configs helper so the config generators can read it too.
 from modules.base_utils.gen_configs import POISONER_BY_TRIGGER_TYPE  # noqa: F401
 
+# The trigger's composition, shared with the optimizer so the attack that is deployed is exactly
+# the one that was optimized. modules.optimizing_trigger.compose imports nothing from the project
+# (its own docstring says why), so this is a plain module-level import and not the in-method one
+# the cycle through modules.optimizing_trigger.utils used to force.
+from modules.optimizing_trigger.compose import apply_trigger_raw, apply_warp
+
 
 SVHN_TRANSFORM_NORMALIZE_MEAN = (0.4377, 0.4438, 0.4728)
 SVHN_TRANSFORM_NORMALIZE_STD = (0.1980, 0.2010, 0.1970)
@@ -428,8 +434,6 @@ class WarpPoisoner(Poisoner):
         self.s = trigger["warp_s"]
 
     def poison(self, x: Image.Image) -> Image.Image:
-        from modules.optimizing_trigger.utils import apply_warp  # local: utils imports this module
-
         x_tensor = transforms.ToTensor()(x)  # [C, H, W]
         return transforms.ToPILImage()(apply_warp(x_tensor, self.control_grid, self.s))
 
@@ -437,16 +441,27 @@ class WarpPoisoner(Poisoner):
 class HybridPoisoner(Poisoner):
     """The warp and the additive perturbation composed (trigger_type='hybrid'). `trigger` is the
     dict saved by generate_labels_trigger_joint: {"delta" (C, H, W), "control_grid" (1, 2, k, k)
-    in pixels, "warp_k", "warp_s"}; the composition order lives in apply_trigger_raw."""
+    in pixels, "warp_k", "warp_s"}; the composition order lives in apply_trigger_raw.
+
+    It may also carry the two optional components of that trigger -- a global photometric map
+    ("color_params" (3, 4), "color_a_max", "color_b_max") and a contrast-masked additive budget
+    ("contrast_mask_floor", "contrast_mask_ksize"). They are absent from any trigger saved before
+    they existed, and the fallbacks below are their "off" values, so an older artifact deploys
+    exactly as it did."""
     def __init__(self, trigger: dict):
         self.perturbation = trigger["delta"].detach()
         self.control_grid = trigger["control_grid"].detach()
         self.k = trigger["warp_k"]
         self.s = trigger["warp_s"]
+        color_params = trigger.get("color_params")
+        self.color_params = color_params.detach() if color_params is not None else None
+        self.color_a_max = trigger.get("color_a_max", 0.05)
+        self.color_b_max = trigger.get("color_b_max", 0.02)
+        # `or None`: a floor of 0.0 means the mask was off, and apply_trigger_raw takes None.
+        self.contrast_mask_floor = trigger.get("contrast_mask_floor") or None
+        self.contrast_mask_ksize = trigger.get("contrast_mask_ksize", 5)
 
     def poison(self, x: Image.Image) -> Image.Image:
-        from modules.optimizing_trigger.utils import apply_trigger_raw  # local: utils imports this module
-
         x_tensor = transforms.ToTensor()(x)  # [C, H, W]
 
         delta = self.perturbation
@@ -458,7 +473,13 @@ class HybridPoisoner(Poisoner):
                 align_corners=False
             ).squeeze(0)
 
-        poisoned_tensor = apply_trigger_raw(x_tensor, delta, self.control_grid, self.s)
+        poisoned_tensor = apply_trigger_raw(
+            x_tensor, delta, self.control_grid, self.s,
+            color_params=self.color_params,
+            color_a_max=self.color_a_max, color_b_max=self.color_b_max,
+            contrast_mask_floor=self.contrast_mask_floor,
+            contrast_mask_ksize=self.contrast_mask_ksize,
+        )
         return transforms.ToPILImage()(poisoned_tensor)
 
 

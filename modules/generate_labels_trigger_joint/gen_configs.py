@@ -102,6 +102,30 @@ TRIGGER_TYPE = "additive"
 WARP_K = 4
 WARP_S = 1.0
 LR_WARP = 0.1
+# Total-variation penalty on the warp CONTROL GRID (lambda_tv only ever applied to the additive
+# delta). Warp visibility tracks the field's local variation, not its amplitude, so this is the
+# knob that makes a larger WARP_K usable at a SMALLER WARP_S. 0.0 = off (no-op).
+LAMBDA_TV_WARP = 0.0
+
+# One draw of the victim's train-time augmentation (RandomCrop(32, padding=EOT_PAD) + flip)
+# applied to the composed triggered image during optimization, fixing the mismatch with the
+# experts, which were trained on triggered images under that augmentation. Free (no extra
+# forward pass). False = off (no-op).
+EOT_AUGMENT = False
+EOT_PAD = 4
+EOT_FLIP = True
+
+# Third trigger mechanism (TRIGGER_TYPE="hybrid" only): a global 3x4 affine photometric map,
+# 12 parameters, invisible at these budgets and invariant to crops/flips. False = off (no-op).
+COLOR_TRIGGER = False
+LR_COLOR = 1e-3
+COLOR_A_MAX = 0.05
+COLOR_B_MAX = 0.02
+
+# Per-pixel additive budget proportional to local contrast (TRIGGER_TYPE="hybrid" only), so
+# EPSILON is spent where it hides rather than uniformly. 0.0 = off (no-op).
+CONTRAST_MASK_FLOOR = 0.0
+CONTRAST_MASK_KSIZE = 5
 
 LAMBDA_GRADMATCH = 1.0
 GRADMATCH_EPS = 1e-8
@@ -196,6 +220,19 @@ trigger_type = "{trigger_type}"
 warp_k = {warp_k}
 warp_s = {warp_s}
 lr_warp = {lr_warp}
+lambda_tv_warp = {lambda_tv_warp}
+
+eot_augment = {eot_augment}
+eot_pad = {eot_pad}
+eot_flip = {eot_flip}
+
+color_trigger = {color_trigger}
+lr_color = {lr_color}
+color_a_max = {color_a_max}
+color_b_max = {color_b_max}
+
+contrast_mask_floor = {contrast_mask_floor}
+contrast_mask_ksize = {contrast_mask_ksize}
 
 trigger_constraint = "{trigger_constraint}"
 align_kappa = {align_kappa}
@@ -272,6 +309,91 @@ def _poisoner_for(trigger_type):
             f"trigger_type must be one of {sorted(POISONER_BY_TRIGGER_TYPE)}, got {trigger_type!r}"
         )
     return POISONER_BY_TRIGGER_TYPE[trigger_type]
+
+
+def generate_centralized_deploy(
+    model_flag,
+    dataset,
+    seed,
+    budgets,
+    trigger_type,
+    gen_agg_method="mean",
+    init=None,
+    dry_run=False,
+):
+    """The centralized counterpart of generate_federated_deploy: rewrites ONLY the cell's own
+    `select_flips` + `train_user_<budget>` configs (the 1vs0 / gen_agg_method branch, at the cell
+    root -- which is where the results scripts read the centralized numbers from), for an
+    ALREADY-GENERATED trigger.
+
+    `generate_cell` writes these too, but it also writes train_expert and gen_labels_trigger_joint
+    alongside them, which would overwrite an existing campaign's record of how its trigger was
+    produced with whatever this module's defaults currently are. This entry point exists so the
+    centralized branch of an existing campaign can be extended to new budgets without touching
+    that record, exactly as --deploy-federated already allows for the federated one.
+
+    Returns (paths, trigger_path, trigger_exists)."""
+    init = INIT if init is None else init
+    poisoner = _poisoner_for(trigger_type)
+
+    lr = LEARNING_RATE.get(model_flag, 0.1)
+    wd = WEIGHT_DECAY.get(model_flag, 2e-4)
+    milestones = MILESTONE.get(model_flag, [75, 125])
+
+    cell_dir = EXP_BASE / cell_name(model_flag, dataset, gen_agg_method, seed)
+    module_dir = cell_dir / "gen_labels_trigger_joint"
+    flips_dir = cell_dir / "select_flips"
+    trig_path = trigger_output_path(module_dir, model_flag, dataset, NUM_POISONED, NUM_HONESTS, init)
+    trigger_exists = trig_path.exists()
+
+    configs = {
+        flips_dir / "config.toml": SELECT_FLIPS_TEMPLATE.format(
+            budgets=budgets,
+            module_dir=module_dir,
+            flips_dir=flips_dir,
+            num_honests=NUM_HONESTS,
+            num_poisoned=NUM_POISONED,
+        ),
+    }
+    for budget in budgets:
+        train_user_dir = cell_dir / f"train_user_{budget}"
+        configs[train_user_dir / "config.toml"] = TRAIN_USER_TEMPLATE.format(
+            flips_dir=flips_dir,
+            train_user_dir=train_user_dir,
+            model_flag=model_flag,
+            dataset=dataset,
+            source_label=SOURCE_LABEL,
+            target_label=TARGET_LABEL,
+            trigger_path=trig_path,
+            poisoner=poisoner,
+            budget=budget,
+            num_honests=NUM_HONESTS,
+            num_poisoned=NUM_POISONED,
+            split_batch=str(SPLIT_BATCH_ACROSS_WORKERS).lower(),
+            agg_method=gen_agg_method,
+            lr=lr,
+            wd=wd,
+            milestones=milestones,
+            wandb_block_train_user=wandb_block(
+                "federated_train_user",
+                f"train_user/{model_flag}/{dataset}/{gen_agg_method}/{budget}/seed{seed}",
+                enabled=WANDB_ENABLED,
+                project=WANDB_PROJECT,
+                mode=WANDB_MODE,
+                entity=WANDB_ENTITY,
+                group=model_flag,
+            ),
+        )
+
+    paths = []
+    for path, content in configs.items():
+        assert "out/checkpoints" not in str(path), f"Refusing to write under out/checkpoints/: {path}"
+        if not dry_run:
+            write_config(path, content)
+            validate_config(path)
+        paths.append(path)
+
+    return paths, trig_path, trigger_exists
 
 
 def generate_federated_deploy(
@@ -378,6 +500,10 @@ def generate_cell(
     lambda_bd=None,
     lambda_joint=None,
     lambda_lpips=None,
+    lambda_tv_warp=None,
+    eot_augment=None,
+    color_trigger=None,
+    contrast_mask_floor=None,
 ):
     delta_min_frac = DELTA_MIN_FRAC if delta_min_frac is None else delta_min_frac
     init = INIT if init is None else init
@@ -389,6 +515,19 @@ def generate_cell(
     warp_k = WARP_K if warp_k is None else warp_k
     warp_s = WARP_S if warp_s is None else warp_s
     lr_warp = LR_WARP if lr_warp is None else lr_warp
+    lambda_tv_warp = LAMBDA_TV_WARP if lambda_tv_warp is None else lambda_tv_warp
+    eot_augment = EOT_AUGMENT if eot_augment is None else eot_augment
+    color_trigger = COLOR_TRIGGER if color_trigger is None else color_trigger
+    contrast_mask_floor = CONTRAST_MASK_FLOOR if contrast_mask_floor is None else contrast_mask_floor
+    # run_module.py raises on these under any other trigger_type (the artifact has nowhere to
+    # carry them, so the deployment would drop them) -- refuse here instead of writing a config
+    # that is certain to abort at run time.
+    for name, enabled in (("color_trigger", color_trigger), ("contrast_mask_floor", contrast_mask_floor)):
+        if enabled and trigger_type != "hybrid":
+            raise ValueError(
+                f"{name} requires --trigger-type hybrid (got {trigger_type!r}): it is carried by "
+                "the hybrid trigger artifact and applied by HybridPoisoner at deploy time."
+            )
     poisoner = _poisoner_for(trigger_type)
     ckpt_subdir = f"{model_flag}_1xs" if checkpoint_tag is None else f"{model_flag}_1xs_{checkpoint_tag}"
 
@@ -486,6 +625,16 @@ def generate_cell(
             warp_k=warp_k,
             warp_s=warp_s,
             lr_warp=lr_warp,
+            lambda_tv_warp=lambda_tv_warp,
+            eot_augment=str(bool(eot_augment)).lower(),
+            eot_pad=EOT_PAD,
+            eot_flip=str(bool(EOT_FLIP)).lower(),
+            color_trigger=str(bool(color_trigger)).lower(),
+            lr_color=LR_COLOR,
+            color_a_max=COLOR_A_MAX,
+            color_b_max=COLOR_B_MAX,
+            contrast_mask_floor=contrast_mask_floor,
+            contrast_mask_ksize=CONTRAST_MASK_KSIZE,
             expert_retrain_interval=EXPERT_RETRAIN_INTERVAL,
             expert_retrain_epochs=EXPERT_RETRAIN_EPOCHS,
             expert_retrain_checkpoint_iters=EXPERT_RETRAIN_CHECKPOINT_ITERS,
@@ -658,6 +807,52 @@ if __name__ == "__main__":
     parser.add_argument("--warp-s", type=float, default=None, help="override WARP_S (max warp displacement, px)")
     parser.add_argument("--lr-warp", type=float, default=None, help="override LR_WARP")
     parser.add_argument(
+        "--lambda-tv-warp",
+        type=float,
+        default=None,
+        help="override LAMBDA_TV_WARP (default 0.0/off): total-variation penalty on the warp "
+        "CONTROL GRID. Warp visibility tracks how fast the displacement field varies, not its "
+        "amplitude, so this is the knob that makes a larger --warp-k usable at a SMALLER --warp-s "
+        "-- more degrees of freedom, visibility held by smoothness instead of amplitude.",
+    )
+    parser.add_argument(
+        "--eot-augment",
+        action="store_true",
+        help="set eot_augment=true: apply one draw of the VICTIM's train-time augmentation "
+        "(RandomCrop + horizontal flip) to the composed triggered image during optimization. The "
+        "matched experts were trained on triggered images under that augmentation while the "
+        "optimization loop feeds them un-augmented ones; one draw per step costs no extra forward "
+        "pass. Matters most for the warp, which a flip mirrors.",
+    )
+    parser.add_argument("--eot-pad", type=int, default=None, help="override EOT_PAD (random-crop padding, raw px)")
+    parser.add_argument(
+        "--no-eot-flip", action="store_true", help="with --eot-augment: crop only, no horizontal flip",
+    )
+    parser.add_argument(
+        "--color-trigger",
+        action="store_true",
+        help="set color_trigger=true: optimize a THIRD trigger mechanism alongside the warp and "
+        "the additive delta -- a global 3x4 affine photometric map (12 parameters). Perceptually "
+        "very cheap at the --color-a-max/--color-b-max budgets, and spatially uniform, hence "
+        "invariant to the victim's crops/flips. Requires --trigger-type hybrid.",
+    )
+    parser.add_argument("--lr-color", type=float, default=None, help="override LR_COLOR (default 1e-3)")
+    parser.add_argument("--color-a-max", type=float, default=None, help="override COLOR_A_MAX (default 0.05)")
+    parser.add_argument("--color-b-max", type=float, default=None, help="override COLOR_B_MAX (default 0.02)")
+    parser.add_argument(
+        "--contrast-mask-floor",
+        type=float,
+        default=None,
+        help="override CONTRAST_MASK_FLOOR (default 0.0/off): make the additive budget per-pixel "
+        "proportional to local contrast, so epsilon is spent where the perturbation hides instead "
+        "of uniformly (a flat sky costs as much budget as a texture but shows far more). Zero "
+        "extra parameters; the weight stays <= 1 so epsilon keeps bounding the deployed "
+        "perturbation. Requires --trigger-type hybrid.",
+    )
+    parser.add_argument(
+        "--contrast-mask-ksize", type=int, default=None, help="override CONTRAST_MASK_KSIZE (default 5)",
+    )
+    parser.add_argument(
         "--epsilon",
         type=float,
         default=None,
@@ -727,6 +922,16 @@ if __name__ == "__main__":
         "already exist on disk). Combine with --deploy-num-poisoned/--deploy-num-honests/"
         "--deploy-agg-method and --budgets/--trigger-type/--exp-base-tag.",
     )
+    parser.add_argument(
+        "--deploy-centralized",
+        action="store_true",
+        help="the centralized counterpart of --deploy-federated: for an ALREADY-GENERATED "
+        "single-cell trigger, rewrite ONLY that cell's own select_flips + train_user_<budget> "
+        "(the 1vs0/--gen-agg-method branch at the cell root) for --budgets. Unlike --single-cell "
+        "it does NOT touch train_expert or gen_labels_trigger_joint, so an existing campaign's "
+        "record of how its trigger was produced is preserved -- use it to extend that campaign's "
+        "centralized branch to budgets it never ran.",
+    )
     parser.add_argument("--deploy-num-poisoned", type=int, default=3, help="with --deploy-federated")
     parser.add_argument("--deploy-num-honests", type=int, default=7, help="with --deploy-federated")
     parser.add_argument(
@@ -763,6 +968,26 @@ if __name__ == "__main__":
         WARP_S = args.warp_s
     if args.lr_warp is not None:
         LR_WARP = args.lr_warp
+    if args.lambda_tv_warp is not None:
+        LAMBDA_TV_WARP = args.lambda_tv_warp
+    if args.eot_augment:
+        EOT_AUGMENT = True
+    if args.eot_pad is not None:
+        EOT_PAD = args.eot_pad
+    if args.no_eot_flip:
+        EOT_FLIP = False
+    if args.color_trigger:
+        COLOR_TRIGGER = True
+    if args.lr_color is not None:
+        LR_COLOR = args.lr_color
+    if args.color_a_max is not None:
+        COLOR_A_MAX = args.color_a_max
+    if args.color_b_max is not None:
+        COLOR_B_MAX = args.color_b_max
+    if args.contrast_mask_floor is not None:
+        CONTRAST_MASK_FLOOR = args.contrast_mask_floor
+    if args.contrast_mask_ksize is not None:
+        CONTRAST_MASK_KSIZE = args.contrast_mask_ksize
     if args.epsilon is not None:
         EPSILON = args.epsilon
     if args.lr_delta is not None:
@@ -780,6 +1005,34 @@ if __name__ == "__main__":
         import json
 
         print(json.dumps(list_grid(), indent=2))
+        raise SystemExit(0)
+
+    if args.deploy_centralized:
+        assert args.budgets is not None, "--deploy-centralized requires --budgets"
+        assert not args.deploy_federated, "pass at most one of --deploy-centralized/--deploy-federated"
+        paths, trig_path, trigger_exists = generate_centralized_deploy(
+            model_flag=args.model_flag or MODEL_FLAGS[0],
+            dataset=args.dataset or DATASETS[0],
+            seed=args.seed if args.seed is not None else SEEDS[0],
+            budgets=budgets_override,
+            trigger_type=TRIGGER_TYPE,
+            gen_agg_method=args.gen_agg_method,
+            dry_run=args.dry_run,
+        )
+        if not trigger_exists:
+            print(
+                f"[ABORT] trigger not found at {trig_path} -- --deploy-centralized only rewrites "
+                "an existing cell's deploy configs, it does not run the GEN phase. Generate the "
+                "cell first (--single-cell with the same --model-flag/--dataset/--seed/"
+                "--trigger-type/--exp-base-tag).",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        label = "[DRY RUN]" if args.dry_run else ""
+        print(f"\n{label} generate_labels_trigger_joint (centralized deploy): {len(paths)} config "
+              f"files {'would be ' if args.dry_run else ''}written, trigger={trig_path}")
+        for p in paths:
+            print(f"  {p}")
         raise SystemExit(0)
 
     if args.deploy_federated:

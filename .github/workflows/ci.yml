@@ -33,3 +33,21 @@ jobs:
         run: |
           python -m modules.generate_labels_trigger_joint.gen_configs
           python -m modules.generate_labels_trigger_joint.gen_configs_paper_main_campaign
+
+  trigger-composition:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      # modules/optimizing_trigger/compose.py imports torch and nothing else -- no dataset, no
+      # model, not even the pytorch_cifar submodule -- so the trigger's composition can be
+      # checked here for the cost of one CPU wheel.
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      # Guards the campaign-comparability promise: with every opt-in knob at its default
+      # (lambda_tv_warp, eot_augment, color_trigger, contrast_mask_floor), the composition must
+      # stay BIT-IDENTICAL to what produced the results already on disk. It also checks that the
+      # optimizer's batched path and the deploy-time poisoner's per-image path agree.
+      - name: Check the trigger composition
+        run: python scripts/check_trigger_composition.py

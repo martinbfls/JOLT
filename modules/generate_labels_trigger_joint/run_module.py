@@ -1,7 +1,8 @@
 """jointly optimizes poisoned logit labels (labels_syn)
 and a backdoor trigger (delta) via trajectory matching, with delta's gradient flowing
 through both the backdoor-efficacy term L_bd and the MTT trajectory-alignment term (param_loss).
-The trigger is an additive perturbation, a WaNet-style warp, or both composed (trigger_type)."""
+The trigger is an additive perturbation, a WaNet-style warp, or both composed (trigger_type),
+optionally with a global photometric map and a contrast-masked additive budget."""
 
 from pathlib import Path
 import math
@@ -46,6 +47,7 @@ from modules.federated_generate_labels.utils import (
 from modules.train_expert.utils import checkpoint_callback
 from modules.optimizing_trigger.utils import (
     get_mu,
+    init_color_params,
     init_delta,
     init_warp_field,
     raw_to_trigger_preprocess,
@@ -85,6 +87,27 @@ def run(experiment_name, module_name, **kwargs):
     matching term, L_bd, L_joint, L_lpips, ...) backpropagates into both components, so the
     optimization is free to split the perturbation budget between them: the point is to reach the
     additive trigger's ASR at a visibly smaller epsilon than it needs on its own.
+
+    Three further knobs buy expressivity or signal at (near) zero compute, all off by default:
+
+    - `lambda_tv_warp` penalizes the control grid's total variation. Perceived warp visibility
+      tracks how fast the displacement field varies, not its amplitude, so this is what makes a
+      larger `warp_k` usable at a SMALLER `warp_s` -- more degrees of freedom, less visibility.
+    - `eot_augment` applies one draw of the victim's train-time augmentation (RandomCrop +
+      RandomHorizontalFlip) to the composed triggered image. The matched experts were trained on
+      triggered images under that augmentation while this loop fed them un-augmented ones.
+    - `color_trigger` adds a third mechanism, a global 3x4 affine color map (12 parameters), and
+      `contrast_mask_floor` makes the additive budget per-pixel proportional to local contrast.
+      Both are rebuilt at deploy time from the saved artifact by HybridPoisoner, so they require
+      trigger_type='hybrid'.
+
+    Note what more trigger expressivity can and cannot do here. At deploy time the victim trains
+    on CLEAN images with flipped labels (federated_train_user) -- the trigger only ever reaches
+    the ASR test set -- so the robust aggregator never sees it and no trigger can evade Krum
+    directly. The only path to surviving aggregation is indirect: a trigger that needs FEWER flips
+    to be induced leaves the poisoned clients' gradients closer to the honest ones. Expressivity
+    should therefore be spent on directions that are perceptually cheap yet simple enough in
+    feature space for label flips on clean data to reproduce them.
 
     :param experiment_name: Name of the experiment in configuration.
     :param module_name: Name of the module in configuration.
@@ -161,10 +184,78 @@ def run(experiment_name, module_name, **kwargs):
     has_warp = trigger_type in ("warp", "hybrid")
     warp_k = args.get("warp_k", 4)
     warp_s = args.get("warp_s", 1.0)  # max displacement, in pixels
+    # Total variation of the control grid. Perceived warp visibility tracks how fast the
+    # displacement field VARIES locally, not its amplitude: a smooth 8 px field is far less
+    # visible than an oscillating 2 px one. Without this term the only handle on visibility is
+    # warp_s, which caps amplitude, so the grid stays stuck at warp_k=4 (32 DOF) and has to buy
+    # its effect with amplitude instead. Penalizing the variation is what makes a larger warp_k
+    # (128 DOF at k=8, 512 at k=16) usable at a SMALLER warp_s.
+    lambda_tv_warp = args.get("lambda_tv_warp", 0.0)
     if has_warp:
         # the control grid's own norms: a second figure, so the additive runs' trigger_norm one
         # (delta_l2/delta_linf, the additive component under 'hybrid') stays comparable as-is
         tracker.add_plot_group("warp_norm", ["warp_l2", "warp_linf"], ylabel="Warp control grid")
+
+    # EOT: one draw of the victim's train-time augmentation per step, applied to the composed
+    # triggered image. The experts whose trajectories are matched were trained on triggered
+    # images under TRANSFORM_TRAIN (RandomCrop(32, padding=4) + RandomHorizontalFlip, applied
+    # AFTER the poisoner -- see get_matching_datasets), while this loop feeds un-augmented ones:
+    # the trigger is then optimized against a distribution the expert never saw. It also makes
+    # the poisoned rows spliced into x_t_adv below consistent with the clean rows around them,
+    # which the dataloader has already augmented.
+    eot_enabled = args.get("eot_augment", False)
+    eot_pad = args.get("eot_pad", 4)
+    eot_flip = args.get("eot_flip", True)
+    if eot_pad < 0:
+        raise ValueError(f"eot_pad must be >= 0, got {eot_pad}")
+    eot = {"pad": eot_pad, "flip": eot_flip} if eot_enabled else None
+    if eot_enabled and needs_big_ims(expert_model_flag):
+        print(
+            f"WARNING: eot_augment=true with a needs_big_ims model ({expert_model_flag}): "
+            f"eot_pad={eot_pad} is applied in RAW pixels before the upsample to 224, while the "
+            "victim's RandomCrop(224, padding=4) jitters at the upsampled resolution -- the two "
+            "crop scales do not match. Sound as-is only for the 32x32 datasets."
+        )
+
+    # Photometric component of the trigger: a global 3x4 affine color map (12 parameters). It is
+    # a third mechanism, orthogonal to the warp and the additive delta: invisible at small
+    # budgets, free to compute, and -- being spatially uniform -- invariant to the victim's crops
+    # and flips, hence a feature the label flips can actually reproduce from clean data.
+    color_trigger = args.get("color_trigger", False)
+    lr_color = args.get("lr_color", 1e-3)
+    color_a_max = args.get("color_a_max", 0.05)
+    color_b_max = args.get("color_b_max", 0.02)
+    has_color = bool(color_trigger)
+
+    # Contrast-masked additive budget: scales delta per pixel by the local contrast of the image
+    # it lands on, so the Linf budget is spent where it hides instead of uniformly. 0.0 = off;
+    # a floor in (0, 1] enables it (the weight stays <= 1, so epsilon keeps bounding the
+    # deployed perturbation).
+    contrast_mask_floor = args.get("contrast_mask_floor", 0.0)
+    contrast_mask_ksize = args.get("contrast_mask_ksize", 5)
+    if not 0.0 <= contrast_mask_floor <= 1.0:
+        raise ValueError(f"contrast_mask_floor must be in [0, 1], got {contrast_mask_floor}")
+    use_contrast_mask = contrast_mask_floor > 0.0
+    if use_contrast_mask and not has_additive:
+        raise ValueError(
+            f"contrast_mask_floor={contrast_mask_floor} reweights the ADDITIVE component's "
+            f"budget, but trigger_type={trigger_type!r} has no additive component."
+        )
+    # Both new components are rebuilt at deploy time from the saved artifact, and only the
+    # 'hybrid' artifact is a dict with somewhere to put them (HybridPoisoner reads them back;
+    # 'additive' saves a bare tensor and 'warp' a warp-only dict). Refuse rather than optimize a
+    # component the deployment would silently drop.
+    for name, enabled in (("color_trigger", has_color), ("contrast_mask_floor", use_contrast_mask)):
+        if enabled and not is_hybrid:
+            raise ValueError(
+                f"{name} requires trigger_type='hybrid' (got {trigger_type!r}): it is carried by "
+                "the hybrid artifact's dict and applied by HybridPoisoner at deploy time, so "
+                "under any other trigger_type the optimized component would not be deployed."
+            )
+    if has_color:
+        tracker.add_plot_group(
+            "color_norm", ["color_a_linf", "color_b_linf"], ylabel="Photometric map",
+        )
 
     epsilon = args.get("epsilon", 0.1)
     lr_delta = args.get("lr_delta", 1e-2)
@@ -329,16 +420,25 @@ def run(experiment_name, module_name, **kwargs):
         )
     )
 
-    def apply_trigger(x_raw, d, cg):
-        """Preprocessed triggered images for the optimized variables: the additive delta `d` and
-        the warp control grid `cg` (each None when its component is off; see apply_trigger_raw)."""
+    def apply_trigger(x_raw, d, cg, col=None, augment=False):
+        """Preprocessed triggered images for the optimized variables: the additive delta `d`, the
+        warp control grid `cg` and the photometric map `col` (each None when its component is off;
+        see apply_trigger_raw). `augment=True` adds one EOT draw of the victim's train-time
+        augmentation -- used for the terms that feed the optimization, never for the ASR readouts
+        below, which must stay on the un-augmented images the ASR test set uses."""
         return raw_to_trigger_preprocess(
             x_raw, d, dataset_flag=dataset_flag, model_flag=expert_model_flag, control_grid=cg, s=warp_s,
+            color_params=col, color_a_max=color_a_max, color_b_max=color_b_max,
+            contrast_mask_floor=contrast_mask_floor if use_contrast_mask else None,
+            contrast_mask_ksize=contrast_mask_ksize,
+            eot=eot if augment else None,
         )
 
     def trigger_artifact():
         """What is saved / handed to the poisoner: the bare tensor (additive) or the dict that
-        rebuilds the warp ('warp') / both components ('hybrid')."""
+        rebuilds the warp ('warp') / every component ('hybrid'). The optional components are
+        written only when enabled, so an artifact from a run without them stays byte-identical
+        and HybridPoisoner's own defaults make an older artifact deploy unchanged."""
         if not has_warp:
             return delta_add.detach().cpu()
         artifact = {
@@ -349,9 +449,17 @@ def run(experiment_name, module_name, **kwargs):
         }
         if has_additive:
             artifact["delta"] = delta_add.detach().cpu()
+        if has_color:
+            artifact["color_params"] = color_params.detach().cpu()
+            artifact["color_a_max"] = color_a_max
+            artifact["color_b_max"] = color_b_max
+        if use_contrast_mask:
+            artifact["contrast_mask_floor"] = contrast_mask_floor
+            artifact["contrast_mask_ksize"] = contrast_mask_ksize
         return artifact
 
     warp_grid = init_warp_field(warp_k, warp_s, device=device) if has_warp else None
+    color_params = init_color_params(device=device) if has_color else None
     delta_add = (
         init_delta(
             mu.shape,
@@ -368,7 +476,13 @@ def run(experiment_name, module_name, **kwargs):
     # to -- the additive perturbation whenever there is one, the control grid under the warp-only
     # trigger (where it is the single optimized variable, as before this file knew about 'hybrid').
     delta = delta_add if has_additive else warp_grid
-    trigger_vars = [v for v in (delta_add, warp_grid) if v is not None]
+    # Named alongside the list because the per-variable gradient norms below are read back by
+    # name: appending a third component must not turn `mtt_warp_grad_norm` into the color one.
+    trigger_var_names, trigger_vars = zip(
+        *[(n, v) for n, v in (("delta", delta_add), ("warp", warp_grid), ("color", color_params)) if v is not None]
+    )
+    trigger_var_names, trigger_vars = list(trigger_var_names), list(trigger_vars)
+    primary_var_name = "delta" if has_additive else "warp"
 
     def accumulate_trigger_grad(loss, weight, extra_targets=(), create_graph=False):
         """Adds weight * dloss/dv into every trigger variable's own .grad -- the manual,
@@ -405,14 +519,14 @@ def run(experiment_name, module_name, **kwargs):
         )
     for v in trigger_vars:
         v.requires_grad_(True)
-    if is_hybrid:
-        # one Adam over both components, each with its own learning rate (they live on different
-        # scales: [0, 1] intensity for delta, pixels for the control grid)
-        optimizer_delta = torch.optim.Adam(
-            [{"params": [delta_add], "lr": lr_delta}, {"params": [warp_grid], "lr": lr_warp}]
-        )
-    else:
-        optimizer_delta = torch.optim.Adam([delta], lr=lr_warp if has_warp else lr_delta)
+    # One Adam over every enabled component, each with its own learning rate: they live on
+    # different scales ([0, 1] intensity for delta, pixels for the control grid, dimensionless
+    # [0, 1] gains for the photometric map). With a single component this is exactly the previous
+    # `Adam([delta], lr=...)`; with delta + warp, exactly the previous two param groups.
+    _lr_by_name = {"delta": lr_delta, "warp": lr_warp, "color": lr_color}
+    optimizer_delta = torch.optim.Adam(
+        [{"params": [v], "lr": _lr_by_name[n]} for n, v in zip(trigger_var_names, trigger_vars)]
+    )
 
     batch_size, epochs, optimizer_expert, optimizer_labels = get_mtt_attack_info(
         expert_models[0].parameters(),
@@ -454,6 +568,7 @@ def run(experiment_name, module_name, **kwargs):
     delta_init = None
     delta_add_init = None
     warp_grid_init = None
+    color_params_init = None
     prev_delta_sign = None
 
     expert_pool = None
@@ -511,6 +626,10 @@ def run(experiment_name, module_name, **kwargs):
             norms.append(f"||delta||_inf={delta_add.abs().max().item():.4f}")
         if has_warp:
             norms.append(f"||control_grid||_inf={warp_grid.abs().max().item():.4f}")
+            norms.append(f"TV(control_grid)={tv_loss(warp_grid.squeeze(0)).item():.4f}")
+        if has_color:
+            norms.append(f"||A||_inf={color_params[:, :3].abs().max().item():.4f}")
+            norms.append(f"||b||_inf={color_params[:, 3].abs().max().item():.4f}")
         print(
             f"[expert_retrain] round {round_idx}: retraining a fresh expert for "
             f"{expert_retrain_epochs} epochs against the CURRENT trigger ({', '.join(norms)})..."
@@ -720,7 +839,11 @@ def run(experiment_name, module_name, **kwargs):
                             if is_poisoned.any():
                                 idx_poisoned = idx[is_poisoned].tolist()
                                 x_raw_adv = _raw_poison_batch(idx_poisoned)
-                                x_trig = apply_trigger(x_raw_adv, delta_add, warp_grid)
+                                # augment=True: these rows feed L_bd and the expert gradient, and
+                                # x_t's other rows are already augmented by the dataloader.
+                                x_trig = apply_trigger(
+                                    x_raw_adv, delta_add, warp_grid, color_params, augment=True,
+                                )
                                 x_t_adv = x_t.clone()
 
                                 x_t_adv[is_poisoned_dev] = x_trig
@@ -787,6 +910,12 @@ def run(experiment_name, module_name, **kwargs):
                                     L_lpips_cid = lpips_penalty(
                                         x_raw_adv, lpips_model, delta=delta_add,
                                         control_grid=warp_grid, warp_s=warp_s,
+                                        color_params=color_params,
+                                        color_a_max=color_a_max, color_b_max=color_b_max,
+                                        contrast_mask_floor=(
+                                            contrast_mask_floor if use_contrast_mask else None
+                                        ),
+                                        contrast_mask_ksize=contrast_mask_ksize,
                                     )
                                     accumulate_trigger_grad(
                                         L_lpips_cid, lambda_lpips / n_checkpoints_per_step,
@@ -895,6 +1024,11 @@ def run(experiment_name, module_name, **kwargs):
                     if trigger_constraint == "penalty":
                         grand_loss = grand_loss + (lambda_align * L_align + lambda_mag * L_mag)
 
+                if has_warp and lambda_tv_warp != 0:
+                    # TV of the displacement field, the visibility handle that lets warp_k grow
+                    # (see lambda_tv_warp above). squeeze(0): tv_loss expects (C, H, W).
+                    grand_loss = grand_loss + lambda_tv_warp * tv_loss(warp_grid.squeeze(0))
+
                 grand_loss = grand_loss + lambda_gradmatch * L_gradmatch_avg
                 grand_loss = grand_loss + lambda_match * L_match_avg
 
@@ -957,13 +1091,16 @@ def run(experiment_name, module_name, **kwargs):
 
                 # What grand_loss.backward() (the MTT matching term and the terms folded into it)
                 # added on top of the manually accumulated L_bd/L_joint/L_lpips gradients, per
-                # trigger variable: [0] is the primary one (delta), [-1] the warp control grid.
-                mtt_trigger_grad_norms = [
-                    (v.grad.detach() - g_manual).norm().item() if v.grad is not None else 0.0
-                    for v, g_manual in zip(trigger_vars, manual_only_grads)
-                ]
-                mtt_delta_grad_norm = mtt_trigger_grad_norms[0]
-                mtt_warp_grad_norm = mtt_trigger_grad_norms[-1] if has_warp else 0.0
+                # trigger variable, looked up by name (see trigger_var_names).
+                mtt_trigger_grad_norms = {
+                    name: (v.grad.detach() - g_manual).norm().item() if v.grad is not None else 0.0
+                    for name, v, g_manual in zip(trigger_var_names, trigger_vars, manual_only_grads)
+                }
+                # mtt_delta_grad_norm describes the PRIMARY variable, i.e. the control grid under
+                # the warp-only trigger, exactly as before this module had a third component.
+                mtt_delta_grad_norm = mtt_trigger_grad_norms[primary_var_name]
+                mtt_warp_grad_norm = mtt_trigger_grad_norms["warp"] if has_warp else 0.0
+                mtt_color_grad_norm = mtt_trigger_grad_norms["color"] if has_color else 0.0
 
                 optimizer_labels.step()
                 optimizer_delta.step()
@@ -976,6 +1113,10 @@ def run(experiment_name, module_name, **kwargs):
                             delta.clamp_(-epsilon, epsilon)
                     if has_warp:
                         warp_grid.clamp_(-warp_s, warp_s)
+                    if has_color:
+                        # the two halves of the 3x4 [A | b] block carry different budgets
+                        color_params[:, :3].clamp_(-color_a_max, color_a_max)
+                        color_params[:, 3].clamp_(-color_b_max, color_b_max)
 
                 for m in expert_models:
                     m.eval()
@@ -990,6 +1131,11 @@ def run(experiment_name, module_name, **kwargs):
                     delta_linf = delta.abs().max().item()
                     warp_l2 = warp_grid.norm().item() if has_warp else 0.0
                     warp_linf = warp_grid.abs().max().item() if has_warp else 0.0
+                    # logged whenever there is a warp, lambda_tv_warp or not: it is the
+                    # visibility proxy to read warp_k/warp_s against
+                    warp_tv = tv_loss(warp_grid.squeeze(0)).item() if has_warp else 0.0
+                    color_a_linf = color_params[:, :3].abs().max().item() if has_color else 0.0
+                    color_b_linf = color_params[:, 3].abs().max().item() if has_color else 0.0
                     if has_additive:
                         L_align_post, cos_target_post = directional_floor_penalty(delta, mu, align_kappa)
                         cos_target_post, L_align_post = cos_target_post.item(), L_align_post.item()
@@ -1010,6 +1156,7 @@ def run(experiment_name, module_name, **kwargs):
                     if just_captured:
                         delta_add_init = delta_add.detach().clone() if has_additive else None
                         warp_grid_init = warp_grid.detach().clone() if has_warp else None
+                        color_params_init = color_params.detach().clone() if has_color else None
                         delta_init = delta_add_init if has_additive else warp_grid_init
                     cos_to_init = cosine_to(delta, delta_init).item()
                     delta_drift_l2 = (delta - delta_init).norm().item()
@@ -1019,8 +1166,12 @@ def run(experiment_name, module_name, **kwargs):
                             f"delta_drift_l2={delta_drift_l2} -- expected exactly 1.0/0.0."
                         )
 
-                    x_trig_eval = apply_trigger(asr_eval_raw, delta_add, warp_grid)
-                    x_trig_eval_frozen = apply_trigger(asr_eval_raw, delta_add_init, warp_grid_init)
+                    # No augment=True here: the ASR test set is built with TRANSFORM_TEST, so
+                    # these readouts must stay on the un-augmented triggered images.
+                    x_trig_eval = apply_trigger(asr_eval_raw, delta_add, warp_grid, color_params)
+                    x_trig_eval_frozen = apply_trigger(
+                        asr_eval_raw, delta_add_init, warp_grid_init, color_params_init,
+                    )
                     asr_mean_list = [
                         (m(x_trig_eval).argmax(dim=1) == target_label).float().mean().item() for m in expert_models
                     ]
@@ -1055,6 +1206,10 @@ def run(experiment_name, module_name, **kwargs):
                     "delta_linf": delta_linf,
                     "warp_l2": warp_l2,
                     "warp_linf": warp_linf,
+                    "warp_tv": warp_tv,
+                    "color_a_linf": color_a_linf,
+                    "color_b_linf": color_b_linf,
+                    "mtt_color_grad_norm": mtt_color_grad_norm,
                     "cos_target": cos_target_post,
                     "cos_source": cos_source_post,
                     "L_align": L_align_post,
@@ -1107,6 +1262,11 @@ def run(experiment_name, module_name, **kwargs):
                 if is_hybrid:  # the warp half, alongside delta_linf/mtt_grad for the additive one
                     postfix["warp_linf"] = f"{warp_linf:.4g}"
                     postfix["mtt_warp_grad"] = f"{mtt_warp_grad_norm:.4g}"
+                if has_warp:
+                    postfix["warp_tv"] = f"{warp_tv:.4g}"
+                if has_color:
+                    postfix["color_a"] = f"{color_a_linf:.4g}"
+                    postfix["color_b"] = f"{color_b_linf:.4g}"
                 pbar.set_postfix(**postfix)
 
     # Save results

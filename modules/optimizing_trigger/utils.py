@@ -13,6 +13,20 @@ from modules.base_utils.datasets import (
 )
 from modules.federated_generate_labels.utils import DEFAULT_EXPERT_CONFIG, DEFAULT_ATTACK_ITERATIONS
 from modules.base_utils.util import needs_big_ims
+# The trigger's own composition lives in a project-free module so the deploy-time poisoners
+# (modules.base_utils.datasets, which this module imports) can use it without an import
+# cycle. Re-exported here so every existing import site keeps working unchanged.
+from modules.optimizing_trigger.compose import (  # noqa: F401
+    apply_color,
+    apply_trigger_raw,
+    apply_warp,
+    contrast_mask,
+    eot_augment,
+    init_color_params,
+    init_delta,
+    init_warp_field,
+    tv_loss,
+)
 from PIL import Image
 from torchvision import transforms
 from torch.utils.data import Subset, ConcatDataset
@@ -54,29 +68,6 @@ def sample_checkpoints(K, S, alpha=0.01, device="cpu"):
     return idx
 
 
-def init_delta(mu_shape, strength=6.0, freq=16, horizontal=True, device="cuda", init='stripe'):
-    if init == 'stripe':
-        C, H, W = mu_shape
-        sin_1d = torch.sin(torch.linspace(0, freq * torch.pi, W, device=device))
-        mask = sin_1d.view(1, 1, W).expand(C, H, W)
-        if horizontal:
-            mask = mask.transpose(1, 2)
-        delta = strength * mask.clone()
-        delta.requires_grad_(True)
-    elif init == 'random':
-        delta = strength * torch.rand(mu_shape, device=device)
-        delta.requires_grad_(True)
-    else:
-        raise ValueError(f"Unknown init type: {init}")
-    return delta
-
-
-def init_warp_field(k, s, device="cuda"):
-    """Control grid (1, 2, k, k) of a WaNet-style warp, in pixels (dx, dy); zero = identity warp. `s` (max
-    displacement in pixels) is enforced by apply_warp / the optimizer's post-step clamp, not by the init."""
-    return torch.zeros(1, 2, k, k, device=device, requires_grad=True)
-
-
 def compute_batch_gradients(model, loss_fn, batch, create_graph, retain_graph=False):
     model.zero_grad(set_to_none=True)
     x, y = batch
@@ -104,12 +95,6 @@ def trigger_penalty_hinge(delta, mu_target, mu_source, kappa, eps=1e-8):
     cos = F.cosine_similarity(delta_f, diff_f, eps=eps).mean()
     return F.relu(cos - kappa)
 
-
-def tv_loss(delta):
-    '''Anisotropic total variation of a (C, H, W) trigger perturbation.'''
-    dh = (delta[:, 1:, :] - delta[:, :-1, :]).abs().sum()
-    dw = (delta[:, :, 1:] - delta[:, :, :-1]).abs().sum()
-    return dh + dw
 
 def extract_experts(expert_config, expert_path):
     config = {**DEFAULT_EXPERT_CONFIG, **expert_config}
@@ -239,52 +224,20 @@ def raw_to_preprocess(x_raw: torch.Tensor, dataset_flag: str, model_flag: str = 
 
 def raw_to_trigger_preprocess(x_raw: torch.Tensor, delta: torch.Tensor,
                                dataset_flag: str, model_flag: str = None,
-                               control_grid: torch.Tensor = None, s: float = 1.0):
+                               control_grid: torch.Tensor = None, s: float = 1.0,
+                               eot: dict = None, **trigger_kwargs):
     """Preprocessed triggered images. `delta` (additive perturbation) and `control_grid` (warp
     displacement field) are composed by apply_warp/apply_trigger_raw; either may be None, both
-    together give the hybrid trigger."""
-    x_trig = apply_trigger_raw(x_raw, delta, control_grid, s)
+    together give the hybrid trigger. `trigger_kwargs` carries apply_trigger_raw's optional
+    components (color_params/color_a_max/color_b_max, contrast_mask_floor/contrast_mask_ksize).
+
+    `eot` (a dict of eot_augment kwargs, e.g. {"pad": 4, "flip": True}) applies ONE draw of the
+    victim's train-time augmentation to the composed triggered image, after the trigger and before
+    normalization -- the deploy pipeline's order. None (default) leaves the behavior unchanged."""
+    x_trig = apply_trigger_raw(x_raw, delta, control_grid, s, **trigger_kwargs)
+    if eot is not None:
+        x_trig = eot_augment(x_trig, **eot)
     return raw_to_preprocess(x_trig, dataset_flag, model_flag)
-
-
-def apply_warp(x_raw: torch.Tensor, control_grid: torch.Tensor, s: float):
-    """Image-agnostic warp of x_raw ((C, H, W) or (B, C, H, W), in [0, 1]). The (1, 2, k, k) control grid is a
-    displacement field in PIXELS (dx, dy), clamped to [-s, s] here (single source of truth for the budget),
-    bicubically upsampled to (H, W), converted to normalized coordinates and added to the identity sampling grid."""
-    squeeze = x_raw.dim() == 3
-    if squeeze:
-        x_raw = x_raw.unsqueeze(0)
-    B, C, H, W = x_raw.shape
-    cg = control_grid.clamp(-s, s)
-    ups = F.interpolate(cg, size=(H, W), mode="bicubic", align_corners=True)
-    ups = ups.permute(0, 2, 3, 1)  # (1, H, W, 2) = (dx_px, dy_px)
-    scale = torch.tensor([2 / (W - 1), 2 / (H - 1)], device=x_raw.device, dtype=x_raw.dtype).view(1, 1, 1, 2)
-    identity_theta = torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]], device=x_raw.device, dtype=x_raw.dtype)
-    base = F.affine_grid(identity_theta, (1, C, H, W), align_corners=True)
-    grid = (base + ups * scale).clamp(-1, 1)
-    warped = F.grid_sample(x_raw, grid.expand(B, -1, -1, -1), mode="bilinear", align_corners=True,
-                           padding_mode="border")
-    return warped.squeeze(0) if squeeze else warped
-
-
-def apply_trigger_raw(x_raw: torch.Tensor, delta: torch.Tensor = None,
-                      control_grid: torch.Tensor = None, s: float = 1.0):
-    """The composed trigger in RAW [0, 1] space -- single source of truth for the composition
-    order, shared by the optimizer (generate_labels_trigger_joint), the LPIPS penalty and the
-    deploy-time poisoners (modules/base_utils/datasets.py):
-
-        clamp(apply_warp(x_raw, control_grid, s) + delta, 0, 1)
-
-    Either component may be None: `control_grid=None` gives the pure additive trigger
-    (trigger_type='additive'), `delta=None` the pure warp ('warp', apply_warp alone -- it needs
-    no clamp, grid_sample interpolating an in-range image stays in range), both the hybrid one
-    ('hybrid'). The warp comes FIRST so the additive pattern lands unaltered on top of the warped
-    image: ||.||_inf of the additive component in the final image is then exactly ||delta||_inf,
-    and each component zeroed out reduces the hybrid trigger exactly to the other one."""
-    x_trig = x_raw if control_grid is None else apply_warp(x_raw, control_grid, s)
-    if delta is not None:
-        x_trig = (x_trig + (delta if x_trig.dim() == 3 else delta.unsqueeze(0))).clamp(0, 1)
-    return x_trig
 
 
 def raw_to_warp_preprocess(x_raw: torch.Tensor, control_grid: torch.Tensor,

@@ -56,7 +56,12 @@ METRICS = {
     # warp control grid (trigger_type='warp'/'hybrid'); displacements are in pixels
     "warp_l2": (r"Warp grid $\|\cdot\|_2$ (px)", 1),
     "warp_linf": (r"Warp grid $\|\cdot\|_\infty$ (px)", 1),
+    "warp_tv": (r"Warp grid TV (px)", 1),
     "mtt_warp_grad_norm": (r"$\|\nabla_{grid} \mathcal{L}_{MTT}\|_2$", 1),
+    # photometric component (color_trigger=true): the 3x4 [A | b] map's two budgets
+    "color_a_linf": (r"Color map $\|A\|_\infty$", 1),
+    "color_b_linf": (r"Color map $\|b\|_\infty$", 1),
+    "mtt_color_grad_norm": (r"$\|\nabla_{color} \mathcal{L}_{MTT}\|_2$", 1),
     "reg_term": ("Label regularization", 1),
 }
 
