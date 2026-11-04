@@ -596,6 +596,17 @@ def _load_hybrid_trigger(delta):
     return _load_trigger_dict(delta, ("delta", "control_grid", "warp_k", "warp_s"), "hybrid")
 
 
+def pick_poisoner_for_trigger(dataset_flag, target_label, trigger):
+    """pick_poisoner for a saved generate_labels_trigger_joint trigger whose type is not known
+    ahead of time (a results script reading whatever a campaign produced): the artifact is a bare
+    tensor for trigger_type='additive' and a dict carrying its own trigger_type otherwise."""
+    loaded = torch.load(trigger) if isinstance(trigger, (str, Path)) else trigger
+    flag = "optimized"
+    if isinstance(loaded, dict):
+        flag = POISONER_BY_TRIGGER_TYPE.get(loaded.get("trigger_type"), "optimized")
+    return pick_poisoner(flag, dataset_flag, target_label, delta=loaded)
+
+
 def pick_poisoner(poisoner_flag, dataset_flag, target_label, delta=None):
     if dataset_flag in ["cifar", "cifar_100", "svhn"]:
         x_poisoner = pick_cifar_poisoner(poisoner_flag, delta=delta)

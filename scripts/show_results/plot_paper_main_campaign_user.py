@@ -30,7 +30,7 @@ from torchvision import transforms
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from modules.base_utils.datasets import load_dataset, pick_poisoner
+from modules.base_utils.datasets import load_dataset, pick_poisoner_for_trigger
 from modules.generate_labels_trigger_joint.gen_configs_paper_main_campaign import (
     EXP_BASE,
     MODEL_FLAGS,
@@ -1008,7 +1008,7 @@ def save_trigger_visual_in(module_dir, model_flag, dataset, label, sample_seed=0
     if isinstance(clean_img, torch.Tensor):
         clean_img = transforms.ToPILImage()(clean_img)
 
-    poisoner = pick_poisoner("optimized", dataset, TARGET_LABEL, delta=str(trig_path))
+    poisoner = pick_poisoner_for_trigger(dataset, TARGET_LABEL, str(trig_path))
     poisoned_img, _ = poisoner.poison((img, SOURCE_LABEL))
     if isinstance(poisoned_img, torch.Tensor):
         poisoned_img = transforms.ToPILImage()(poisoned_img)

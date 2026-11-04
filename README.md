@@ -210,17 +210,26 @@ than the `multikrum_3vs7` default.
 
 ### All of a campaign's results in one command
 
-`scripts/show_results/run_all_campaign.sh` runs every results script that can be pointed at an
-arbitrary set of `VARIANT_TAGS` — `plot_warp_multibudget.py` then `analyze_asr_dynamics.py` —
-into `$OUT_ROOT/{vs_budget,asr_dynamics}/`. It is the counterpart of `run_all_out_iclr.sh` for
-the trigger campaigns, but submits nothing: both scripts read a few hundred small files, so it
-runs on the login node, inside an `srun`, or as the dependency-gated job the orchestrators
-submit. A step that aborts (a campaign still running has missing cells) does not hide the other.
+`scripts/show_results/run_all_campaign.sh` is the counterpart of `run_all_out_iclr.sh` for the
+trigger campaigns: it produces **every visualization `run_all_out_iclr.sh` does**, plus the two
+specific to these campaigns, into `$OUT_ROOT/`.
 
 ```bash
 VARIANT_TAGS="hybrid_eps0p25_s8p0 hybrid_eps0p0627_s8p0" SEEDS="0 1 2" \
-    ./scripts/show_results/run_all_campaign.sh
+    SLURM_ACCOUNT=<account> ./scripts/show_results/run_all_campaign.sh
 ```
+
+It submits itself as one CPU-only job on `SLURM_PARTITION` — the campaign's own partition, since
+`pine` accepts `srun` from an RDHPC node but refuses `sbatch` from one — so nothing runs on the
+login node. It executes inline instead when already inside an allocation (`SLURM_JOB_ID` set) or
+with `SUBMIT=0`. A step that aborts (a running campaign has missing cells) never hides the others;
+the exit status counts the failures.
+
+The four `out_iclr` scripts only read the `paper_main_campaign` tree layout, so rather than
+teaching them a second one, step 3 builds a **symlink view** of the campaign in that shape
+(`make_paper_layout_view.py` — no copying, rebuilt on every run) and the rest run against it with
+`--jolt-root`. Outputs: `vs_budget/`, `asr_dynamics/`, `paper_main_campaign_user/` (+ `tables/`,
+`results_csv/`), `per_seed/`, `flip_matrix/`, `trigger_grid/`.
 
 `sweep_hybrid_epsilon_slurm.sh` and `run_warp_multibudget_vs_multikrum_slurm.sh` both gate a
 final Slurm job on it, so a campaign produces its own detailed results without a second command.

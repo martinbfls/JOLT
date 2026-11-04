@@ -13,11 +13,15 @@
 #   1. plot_warp_multibudget.py   ASR/CTA vs budget, one line per tag, mean +/- std over seeds
 #   2. analyze_asr_dynamics.py    per-epoch dynamics: peak vs final ASR, when it peaked, and the
 #                                 series that say why it collapsed (both branches)
+#   3. make_paper_layout_view.py  symlink view so the next three, which only read the
+#                                 paper_main_campaign layout, work on this tree unchanged
+#   4. plot_paper_main_campaign_user.py   CTA-vs-ASR trade-off plots + LaTeX tables
+#   5. plot_asr_per_seed.py + plot_flip_matrix.py
+#   6. plot_trigger_grid.py               clean vs poisoned, one row per tag
 #
-# NOT run here (bound to the paper_main_campaign layout, no --root/--variant-tags override):
-# plot_paper_main_campaign_user.py, plot_asr_per_seed.py, plot_flip_matrix.py, plot_trigger_grid.py
-# -- use run_all_out_iclr.sh for those. visualize_trigger.py is already invoked per cell by the
-# orchestrators, right after GEN. summarize_warp_sweep.py only discovers warp_s*_lpips* dirs.
+# i.e. every visualization run_all_out_iclr.sh produces, plus the two that are specific to these
+# campaigns. NOT run here: visualize_trigger.py (already invoked per cell by the orchestrators,
+# right after GEN) and summarize_warp_sweep.py (only discovers warp_s*_lpips* dirs).
 #
 # Nothing runs on the login node: by default this SUBMITS itself as a single CPU-only job on
 # SLURM_PARTITION -- the same partition as the campaign, since `pine` accepts srun from an RDHPC
@@ -115,16 +119,62 @@ echo "=== [1/2] plot_warp_multibudget.py (ASR/CTA vs budget) ==="
     --per-seed --out-dir "$OUT_ROOT/vs_budget" || { echo "[WARN] step 1 failed" >&2; failures=$((failures + 1)); }
 
 echo
-echo "=== [2/2] analyze_asr_dynamics.py (per-epoch dynamics, both branches) ==="
+echo "=== [2/6] analyze_asr_dynamics.py (per-epoch dynamics, both branches) ==="
 "$PYTHON" scripts/show_results/analyze_asr_dynamics.py \
     "${COMMON[@]}" --variant-tags "${_TAGS[@]}" \
     --seeds "${_SEEDS[@]}" --budgets "${_BUDGETS[@]}" \
     --branch both --out-dir "$OUT_ROOT/asr_dynamics" || { echo "[WARN] step 2 failed" >&2; failures=$((failures + 1)); }
 
+# ---------------------------------------------------------------------------
+# The four run_all_out_iclr.sh visualizations. They only read the paper_main_campaign tree
+# layout, so they run against a symlink view of this campaign (see make_paper_layout_view.py)
+# rather than being taught a second layout.
+# ---------------------------------------------------------------------------
+VIEW="${VIEW:-$OUT_ROOT/paper_layout_view}"
+echo
+echo "=== [3/6] make_paper_layout_view.py (symlink view for the out_iclr scripts) ==="
+if "$PYTHON" scripts/show_results/make_paper_layout_view.py \
+        --exp-root "$EXP_ROOT" --exp-base-prefix "$EXP_BASE_PREFIX" \
+        --variant-tags "${_TAGS[@]}" --model-flag "$MODEL_FLAG" --dataset "$DATASET" \
+        --gen-agg-method "$GEN_AGG_METHOD" --seeds "${_SEEDS[@]}" \
+        --deploy-agg-method "$DEPLOY_AGG_METHOD" \
+        --deploy-num-poisoned "$DEPLOY_NUM_POISONED" --deploy-num-honests "$DEPLOY_NUM_HONESTS" \
+        --out "$VIEW"; then
+    echo
+    echo "=== [4/6] plot_paper_main_campaign_user.py (CTA-vs-ASR + LaTeX tables) ==="
+    "$PYTHON" scripts/show_results/plot_paper_main_campaign_user.py \
+        --model "$MODEL_FLAG" --datasets "$DATASET" --tags "${_TAGS[@]}" \
+        --seeds "${_SEEDS[@]}" --jolt-root "$VIEW" \
+        --out-dir "$OUT_ROOT/paper_main_campaign_user" \
+        --csv-dir "$OUT_ROOT/results_csv" --table-dir "$OUT_ROOT/tables" \
+        || { echo "[WARN] step 4 failed" >&2; failures=$((failures + 1)); }
+
+    echo
+    echo "=== [5/6] plot_asr_per_seed.py + plot_flip_matrix.py ==="
+    "$PYTHON" scripts/show_results/plot_asr_per_seed.py \
+        --campaign jolt --root "$VIEW" --model "$MODEL_FLAG" --datasets "$DATASET" \
+        --tags "${_TAGS[@]}" --seeds "${_SEEDS[@]}" --budgets "${_BUDGETS[@]}" \
+        --out-dir "$OUT_ROOT/per_seed" || { echo "[WARN] plot_asr_per_seed failed" >&2; failures=$((failures + 1)); }
+    "$PYTHON" scripts/show_results/plot_flip_matrix.py \
+        --campaign jolt --root "$VIEW" --model "$MODEL_FLAG" --datasets "$DATASET" \
+        --tags "${_TAGS[@]}" --seeds "${_SEEDS[@]}" --budgets "${_BUDGETS[@]}" \
+        --out-dir "$OUT_ROOT/flip_matrix" || { echo "[WARN] plot_flip_matrix failed" >&2; failures=$((failures + 1)); }
+
+    echo
+    echo "=== [6/6] plot_trigger_grid.py (clean vs poisoned, one row per tag) ==="
+    "$PYTHON" scripts/show_results/plot_trigger_grid.py \
+        --models "$MODEL_FLAG" --datasets "$DATASET" --tags "${_TAGS[@]}" \
+        --jolt-root "$VIEW" --out-dir "$OUT_ROOT/trigger_grid" \
+        || { echo "[WARN] step 6 failed" >&2; failures=$((failures + 1)); }
+else
+    echo "[WARN] no cell to build the view from -- steps 4-6 skipped" >&2
+    failures=$((failures + 1))
+fi
+
 echo
 if [ "$failures" -gt 0 ]; then
-    echo "[DONE] $failures/2 step(s) failed (campaign still running? see their own output above)."
+    echo "[DONE] $failures step(s) failed (campaign still running? see their own output above)."
 else
-    echo "[DONE] results under $OUT_ROOT/{vs_budget,asr_dynamics}"
+    echo "[DONE] results under $OUT_ROOT/"
 fi
 exit "$failures"

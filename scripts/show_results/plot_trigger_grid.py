@@ -28,7 +28,7 @@ from plot_paper_main_campaign_user import (  # noqa: E402
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from modules.base_utils.datasets import load_dataset, pick_poisoner  # noqa: E402
+from modules.base_utils.datasets import load_dataset, pick_poisoner_for_trigger  # noqa: E402
 
 # "baseline" tag's epsilon value, spelled out for readability.
 TAG_COLUMN_LABELS = {
@@ -72,7 +72,7 @@ def load_clean_and_poisoned(model_flag, dataset, tags, seed, exp_base, sample_se
         if not trig_path.exists():
             poisoned[tag] = None
             continue
-        poisoner = pick_poisoner("optimized", dataset, TARGET_LABEL, delta=str(trig_path))
+        poisoner = pick_poisoner_for_trigger(dataset, TARGET_LABEL, str(trig_path))
         poisoned_img, _ = poisoner.poison((img, SOURCE_LABEL))
         poisoned[tag] = _to_pil(poisoned_img)
 
