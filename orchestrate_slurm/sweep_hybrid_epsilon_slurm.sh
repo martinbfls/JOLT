@@ -17,9 +17,9 @@
 # cell that was already generated at one budget, which is not the case here.
 #
 # Once every cell has finished, a final Slurm job (gated on all of them via --dependency) runs
-# scripts/show_results/plot_warp_multibudget.py over the hybrid cells PLUS REFERENCE_TAGS (the
-# existing warp runs, by default), so the ASR/CTA-vs-budget figure compares them side by side on
-# the same seeds.
+# scripts/show_results/run_all_campaign.sh over the hybrid cells PLUS REFERENCE_TAGS (the
+# existing warp runs, by default), producing both the ASR/CTA-vs-budget figures and the
+# per-epoch dynamics analysis, on the same seeds.
 #
 # The final figure job goes to the campaign's own partition (SLURM_PARTITION); override it with
 # SUMMARY_PARTITION if you have a CPU-only one that accepts sbatch from this login node. If it
@@ -63,6 +63,8 @@ export LAMBDA_LPIPS="${LAMBDA_LPIPS:-0.0}"
 export WARP_K="${WARP_K:-4}"
 export LR_WARP="${LR_WARP:-0.1}"
 export LR_DELTA="${LR_DELTA:-}"   # empty leaves gen_configs.py's own default (1e-2)
+# 1 = federated victim with the same optimizer-step count as the centralized one
+export SPLIT_BATCH="${SPLIT_BATCH:-0}"
 
 MODEL_FLAG="${MODEL_FLAG:-r32p}"
 DATASET="${DATASET:-cifar}"
@@ -129,15 +131,12 @@ done
 
 echo "[SWEEP] all $n_cells cells submitted (or dry-run-previewed)."
 
-# ${arr[@]+...}: REFERENCE_TAGS="" gives an empty array, which plain "${arr[@]}" makes `set -u` reject
-PLOT_TAGS=("${TAGS[@]}" ${REFERENCE_TAGS_ARR[@]+"${REFERENCE_TAGS_ARR[@]}"})
-plot_cmd="python scripts/show_results/plot_warp_multibudget.py --per-seed"
-plot_cmd+=" --variant-tags ${PLOT_TAGS[*]}"
-plot_cmd+=" --model-flag $MODEL_FLAG --dataset $DATASET"
-plot_cmd+=" --seeds ${SEEDS_ARR[*]} --budgets ${_BUDGETS_ARR[*]}"
-plot_cmd+=" --deploy-agg-method $DEPLOY_AGG_METHOD"
-plot_cmd+=" --deploy-num-poisoned $DEPLOY_NUM_POISONED --deploy-num-honests $DEPLOY_NUM_HONESTS"
-plot_cmd+=" --out-dir $SUMMARY_OUT"
+plot_cmd="VARIANT_TAGS='${TAGS[*]}' REFERENCE_TAGS='${REFERENCE_TAGS_ARR[*]:-}'"
+plot_cmd+=" MODEL_FLAG=$MODEL_FLAG DATASET=$DATASET"
+plot_cmd+=" SEEDS='${SEEDS_ARR[*]}' BUDGETS='${_BUDGETS_ARR[*]}'"
+plot_cmd+=" DEPLOY_AGG_METHOD=$DEPLOY_AGG_METHOD"
+plot_cmd+=" DEPLOY_NUM_POISONED=$DEPLOY_NUM_POISONED DEPLOY_NUM_HONESTS=$DEPLOY_NUM_HONESTS"
+plot_cmd+=" OUT_ROOT=$SUMMARY_OUT ./scripts/show_results/run_all_campaign.sh"
 
 if [ "$DRY_RUN" = "1" ]; then
     echo "[SWEEP] DRY_RUN=1: skipping the final figure job. It would have run:"
@@ -157,9 +156,9 @@ plot_dep="afterok:$(join_job_ids "${ALL_FINAL_JOB_IDS[@]}")"
 # Never `exit 1` on a failed figure submission: the campaign is already queued at this point, so
 # losing the command the user would need afterwards is the worst possible outcome.
 if plot_job=$(GPUS_PER_TASK=0 CPUS_PER_TASK=4 MEM_PER_TASK=8G TIME_PER_TASK=00:15:00 \
-        submit_job_slurm "$plot_cmd" "hybrid_sweep_plot" "$plot_dep" "$SUMMARY_PARTITION"); then
+        submit_job_slurm "$plot_cmd" "hybrid_sweep_results" "$plot_dep" "$SUMMARY_PARTITION"); then
     echo "[SWEEP] figure job $plot_job submitted on $SUMMARY_PARTITION, depends on ${#ALL_FINAL_JOB_IDS[@]} final jobs (afterok)"
-    echo "[SWEEP] once it completes: $SUMMARY_OUT/asr_cta_vs_budget.png, summary.md, per_seed.csv"
+    echo "[SWEEP] once it completes: $SUMMARY_OUT/{vs_budget,asr_dynamics}/"
     echo "[SWEEP] a cell that fails leaves the figure job pending -- scancel it and run this by hand:"
 else
     echo "[SWEEP] the figure job could NOT be submitted -- the ${#ALL_FINAL_JOB_IDS[@]} campaign jobs above are unaffected." >&2

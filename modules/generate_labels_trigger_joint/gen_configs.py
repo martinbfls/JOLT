@@ -109,6 +109,12 @@ GRADMATCH_METRIC = "relerr"  # or "cosine"
 
 DETACH_PARAM_DIST = False  # if true, param_dist is detached in mtt_term_k's denominator
 
+# federated_train_user's `batch_size` is PER WORKER, so a federated victim takes num_workers times
+# fewer optimizer steps than the centralized one at equal epochs, and ends up under-trained. True
+# makes it the TOTAL instead (batch_size//num_workers each), matching the centralized step count --
+# see schemas/federated_train_user.toml. Changes every federated number: do not mix within a campaign.
+SPLIT_BATCH_ACROSS_WORKERS = False
+
 LEARNING_RATE = {"r32p": 0.1, "r18": 0.1, "vgg": 0.01}
 WEIGHT_DECAY = {"r32p": 2e-4, "r18": 2e-4, "vgg": 2e-4}
 MILESTONE = {"r32p": [75, 125], "r18": [75, 125], "vgg": [125]}
@@ -239,6 +245,7 @@ delta = "{trigger_path}"
 budget = {budget}
 num_honests = {num_honests}
 num_poisoned = {num_poisoned}
+split_batch_across_workers = {split_batch}
 agg_method = "{agg_method}"
 optim_kwargs = {{lr = {lr}, momentum = 0.9, nesterov = true, weight_decay = {wd}}}
 scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
@@ -324,6 +331,7 @@ def generate_federated_deploy(
             budget=budget,
             num_honests=deploy_num_honests,
             num_poisoned=deploy_num_poisoned,
+            split_batch=str(SPLIT_BATCH_ACROSS_WORKERS).lower(),
             agg_method=deploy_agg_method,
             lr=lr,
             wd=wd,
@@ -520,6 +528,7 @@ def generate_cell(
             budget=budget,
             num_honests=NUM_HONESTS,
             num_poisoned=NUM_POISONED,
+            split_batch=str(SPLIT_BATCH_ACROSS_WORKERS).lower(),
             agg_method=agg_method,
             lr=lr,
             wd=wd,
@@ -657,6 +666,15 @@ if __name__ == "__main__":
         "0.0314 for 8/255); unused under --trigger-type warp.",
     )
     parser.add_argument("--lr-delta", type=float, default=None, help="override LR_DELTA (default 1e-2)")
+    parser.add_argument(
+        "--split-batch-across-workers",
+        action="store_true",
+        help="write split_batch_across_workers=true into the train_user configs: `batch_size` "
+        "becomes the TOTAL across workers (batch_size//num_workers each) instead of per-worker, "
+        "so a federated victim takes the same number of optimizer steps as the centralized one "
+        "rather than num_workers times fewer. Changes every federated number -- see "
+        "schemas/federated_train_user.toml.",
+    )
     parser.add_argument("--lambda-bd", type=float, default=None, help="override LAMBDA_BD (default 2.0)")
     parser.add_argument(
         "--lambda-joint",
@@ -749,6 +767,8 @@ if __name__ == "__main__":
         EPSILON = args.epsilon
     if args.lr_delta is not None:
         LR_DELTA = args.lr_delta
+    if args.split_batch_across_workers:
+        SPLIT_BATCH_ACROSS_WORKERS = True
     if args.lambda_bd is not None:
         LAMBDA_BD = args.lambda_bd
     if args.lambda_joint is not None:

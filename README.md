@@ -208,6 +208,38 @@ Pass `--exp-root` to read another results tree (e.g. `experiments/out_iclr`), an
 `--deploy-agg-method`/`--deploy-num-poisoned`/`--deploy-num-honests` for a different deployment
 than the `multikrum_3vs7` default.
 
+### All of a campaign's results in one command
+
+`scripts/show_results/run_all_campaign.sh` runs every results script that can be pointed at an
+arbitrary set of `VARIANT_TAGS` — `plot_warp_multibudget.py` then `analyze_asr_dynamics.py` —
+into `$OUT_ROOT/{vs_budget,asr_dynamics}/`. It is the counterpart of `run_all_out_iclr.sh` for
+the trigger campaigns, but submits nothing: both scripts read a few hundred small files, so it
+runs on the login node, inside an `srun`, or as the dependency-gated job the orchestrators
+submit. A step that aborts (a campaign still running has missing cells) does not hide the other.
+
+```bash
+VARIANT_TAGS="hybrid_eps0p25_s8p0 hybrid_eps0p0627_s8p0" SEEDS="0 1 2" \
+    ./scripts/show_results/run_all_campaign.sh
+```
+
+`sweep_hybrid_epsilon_slurm.sh` and `run_warp_multibudget_vs_multikrum_slurm.sh` both gate a
+final Slurm job on it, so a campaign produces its own detailed results without a second command.
+
+### Federated victim: optimizer-step count
+
+`federated_train_user`'s `batch_size` is **per worker**, so at equal `epochs` a federated victim
+takes `num_workers` times fewer optimizer steps than the centralized one while each worker holds
+`1/num_workers` of the data — on CIFAR-10/r32p with 10 workers, 20 steps per epoch against 196,
+and a victim that ends up visibly under-trained (~87.5% vs ~92.6% CTA at budget 0; the published
+ResNet-32 figure is ~92.5%). Every federated number is then confounded with under-training.
+
+`split_batch_across_workers = true` makes `batch_size` the **total** instead
+(`batch_size // num_workers` each), restoring both the step count and the effective batch. It is
+off by default — turning it on changes every federated number, so a campaign must not mix the two
+conventions. Pass `--split-batch-across-workers` to `gen_configs.py`, or `SPLIT_BATCH=1` to the
+Slurm orchestrators; send its results to their own `RESULTS_OUT`, since they are not comparable
+with a cell's existing ones.
+
 ### ASR dynamics (did the backdoor survive, or just peak?)
 
 `scripts/show_results/analyze_asr_dynamics.py` reads the per-epoch series instead of the final

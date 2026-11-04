@@ -51,6 +51,7 @@ def run(experiment_name, module_name, **kwargs):
     num_honests = args.get("num_honests", 0)
     num_poisoned = args.get("num_poisoned", 1)
     num_workers = num_honests + num_poisoned
+    split_batch_across_workers = args.get("split_batch_across_workers", False)
     budget = args.get("budget", 1500)
     input_dir = Path(slurmify_path(args["input_labels"], slurm_id))
     true_path = slurmify_path(args.get("true_labels", None), slurm_id)
@@ -131,6 +132,25 @@ def run(experiment_name, module_name, **kwargs):
         optim_kwargs,
         scheduler_kwargs,
     )
+
+    # mini_train_multi gives EACH worker a loader of `batch_size`, so one optimizer step consumes
+    # num_workers * batch_size examples while each worker only holds 1/num_workers of the data:
+    # at equal epochs the federated victim takes num_workers times FEWER steps than the
+    # centralized one, and ends up visibly under-trained. Splitting the batch restores both the
+    # step count and the effective batch (this is what generate_labels_trigger_joint already does
+    # for its own clients). Off by default: it changes every federated number.
+    if split_batch_across_workers:
+        per_worker = batch_size // num_workers
+        if per_worker < 1:
+            raise ValueError(
+                f"split_batch_across_workers=true needs batch_size ({batch_size}) >= num_workers "
+                f"({num_workers}); it would floor to {per_worker} example(s) per worker."
+            )
+        print(
+            f"split_batch_across_workers: {batch_size} total -> {per_worker} per worker across "
+            f"{num_workers} workers (effective batch {per_worker * num_workers})."
+        )
+        batch_size = per_worker
 
     train_result = mini_train_multi(
         model=model_retrain,

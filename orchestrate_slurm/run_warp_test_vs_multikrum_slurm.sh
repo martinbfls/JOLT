@@ -61,6 +61,9 @@ LAMBDA_JOINT="${LAMBDA_JOINT:-1.0}"
 LAMBDA_LPIPS="${LAMBDA_LPIPS:-0.0}"
 # Additive half (TRIGGER_TYPE=additive/hybrid); unset leaves gen_configs.py's own defaults.
 EPSILON="${EPSILON:-}"
+# 1 = the federated victim takes the same number of optimizer steps as the centralized one
+# (split_batch_across_workers, see schemas/federated_train_user.toml). Changes every federated number.
+SPLIT_BATCH="${SPLIT_BATCH:-0}"
 LR_DELTA="${LR_DELTA:-}"
 
 DEPLOY_NUM_POISONED="${DEPLOY_NUM_POISONED:-3}"
@@ -79,6 +82,7 @@ FED_DEPLOY_REL="$CELL_REL/${DEPLOY_AGG_METHOD}_${DEPLOY_NUM_POISONED}vs${DEPLOY_
 
 echo "[PLAN] variant=$VARIANT_TAG trigger_type=$TRIGGER_TYPE warp_s=$WARP_S warp_k=$WARP_K lambda_bd=$LAMBDA_BD lambda_joint=$LAMBDA_JOINT lambda_lpips=$LAMBDA_LPIPS"
 echo "[PLAN] additive half: epsilon=${EPSILON:-<gen_configs default>} lr_delta=${LR_DELTA:-<gen_configs default>}"
+echo "[PLAN] split_batch_across_workers=$SPLIT_BATCH (1 = same optimizer-step count as centralized)"
 echo "[PLAN] model=$MODEL_FLAG dataset=$DATASET seed=$SEED budgets=$BUDGETS_SINGLE"
 echo "[PLAN] centralized (1vs0, mean) vs federated ($DEPLOY_AGG_METHOD, ${DEPLOY_NUM_POISONED}vs${DEPLOY_NUM_HONESTS})"
 
@@ -105,6 +109,7 @@ GEN_ARGS=(--single-cell --trigger-type "$TRIGGER_TYPE" --exp-base-tag "$VARIANT_
           --warp-s "$WARP_S" --warp-k "$WARP_K" --lr-warp "$LR_WARP"
           --lambda-bd "$LAMBDA_BD" --lambda-joint "$LAMBDA_JOINT" --lambda-lpips "$LAMBDA_LPIPS")
 [ -n "$EPSILON" ] && GEN_ARGS+=(--epsilon "$EPSILON")
+[ "$SPLIT_BATCH" = "1" ] && GEN_ARGS+=(--split-batch-across-workers)
 [ -n "$LR_DELTA" ] && GEN_ARGS+=(--lr-delta "$LR_DELTA")
 [ "$DRY_RUN" = "1" ] && GEN_ARGS+=(--dry-run)
 run_gen_configs_on_compute_node "${GEN_ARGS[@]}"
@@ -187,6 +192,7 @@ fed_gen_cmd="python -m modules.generate_labels_trigger_joint.gen_configs --deplo
 fed_gen_cmd+=" --trigger-type $TRIGGER_TYPE --exp-base-tag $VARIANT_TAG --model-flag $MODEL_FLAG --dataset $DATASET --seed $SEED"
 fed_gen_cmd+=" --budgets '$BUDGETS_SINGLE' --deploy-num-poisoned $DEPLOY_NUM_POISONED"
 fed_gen_cmd+=" --deploy-num-honests $DEPLOY_NUM_HONESTS --deploy-agg-method $DEPLOY_AGG_METHOD"
+[ "$SPLIT_BATCH" = "1" ] && fed_gen_cmd+=" --split-batch-across-workers"
 FED_GEN_JOBS=("$fed_gen_cmd|${VARIANT_TAG}_fed_gen_${MODEL_FLAG}_${DATASET}_seed${SEED}")
 TIME_PER_TASK="$GEN_CONFIGS_TIME"
 GPUS_PER_TASK=0 CPUS_PER_TASK=2 MEM_PER_TASK=4G submit_job_pool_slurm FED_GEN_JOBS "${VARIANT_TAG}_fed_gen" "afterok:$gen_barrier" || exit 1
