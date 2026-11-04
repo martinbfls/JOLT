@@ -191,7 +191,7 @@ echo "  experiments/<tag_cell>/${DEPLOY_AGG_METHOD}_${DEPLOY_NUM_POISONED}vs${DE
 # ---------------------------------------------------------------------------
 # Detailed results, gated on every train_user job above (see run_all_campaign.sh).
 # ---------------------------------------------------------------------------
-results_cmd="VARIANT_TAGS='$VARIANT_TAGS' MODEL_FLAG=$MODEL_FLAG DATASET=$DATASET"
+results_cmd="SUBMIT=0 VARIANT_TAGS='$VARIANT_TAGS' MODEL_FLAG=$MODEL_FLAG DATASET=$DATASET"
 results_cmd+=" GEN_AGG_METHOD=$GEN_AGG_METHOD SEEDS='$SEEDS' BUDGETS='$BUDGETS'"
 results_cmd+=" DEPLOY_AGG_METHOD=$DEPLOY_AGG_METHOD"
 results_cmd+=" DEPLOY_NUM_POISONED=$DEPLOY_NUM_POISONED DEPLOY_NUM_HONESTS=$DEPLOY_NUM_HONESTS"

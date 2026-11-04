@@ -131,7 +131,7 @@ done
 
 echo "[SWEEP] all $n_cells cells submitted (or dry-run-previewed)."
 
-plot_cmd="VARIANT_TAGS='${TAGS[*]}' REFERENCE_TAGS='${REFERENCE_TAGS_ARR[*]:-}'"
+plot_cmd="SUBMIT=0 VARIANT_TAGS='${TAGS[*]}' REFERENCE_TAGS='${REFERENCE_TAGS_ARR[*]:-}'"
 plot_cmd+=" MODEL_FLAG=$MODEL_FLAG DATASET=$DATASET"
 plot_cmd+=" SEEDS='${SEEDS_ARR[*]}' BUDGETS='${_BUDGETS_ARR[*]}'"
 plot_cmd+=" DEPLOY_AGG_METHOD=$DEPLOY_AGG_METHOD"

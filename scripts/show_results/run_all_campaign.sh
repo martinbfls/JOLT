@@ -19,21 +19,23 @@
 # -- use run_all_out_iclr.sh for those. visualize_trigger.py is already invoked per cell by the
 # orchestrators, right after GEN. summarize_warp_sweep.py only discovers warp_s*_lpips* dirs.
 #
-# Unlike run_all_out_iclr.sh this submits nothing: these two read a few hundred small files and
-# take seconds, so it runs wherever you start it (login node, inside an srun, or as the
-# dependency-gated job the sweep scripts submit).
+# Nothing runs on the login node: by default this SUBMITS itself as a single CPU-only job on
+# SLURM_PARTITION -- the same partition as the campaign, since `pine` accepts srun from an RDHPC
+# node but refuses sbatch from one. It runs inline instead when it is already inside an
+# allocation (SLURM_JOB_ID set, e.g. the dependency-gated job the orchestrators submit, or your
+# own srun --pty), or when given SUBMIT=0.
 #
-# Usage (from repo root, conda env active):
+# Usage (from repo root):
 #   VARIANT_TAGS="hybrid_eps0p25_s8p0 hybrid_eps0p0627_s8p0" SEEDS="0 1 2" \
-#       ./scripts/show_results/run_all_campaign.sh
-#   VARIANT_TAGS=hybrid_eps0p0627_s8p0 OUT_ROOT=experiments/federated_experiments/my_run \
-#       ./scripts/show_results/run_all_campaign.sh
+#       SLURM_ACCOUNT=<account> ./scripts/show_results/run_all_campaign.sh
+#   SUBMIT=0 VARIANT_TAGS=hybrid_eps0p0627_s8p0 ./scripts/show_results/run_all_campaign.sh
 ###
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${BASE_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+export BASE_DIR
 cd "$BASE_DIR"
 
 PYTHON="${PYTHON:-python}"
@@ -55,6 +57,37 @@ OUT_ROOT="${OUT_ROOT:-$EXP_ROOT/campaign_results}"
 if [ -z "${VARIANT_TAGS// /}" ]; then
     echo "[ABORT] VARIANT_TAGS is required, e.g. VARIANT_TAGS='hybrid_eps0p0627_s8p0'" >&2
     exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Submit ourselves, unless already running inside an allocation (the gated job
+# the orchestrators submit, or an interactive srun) or told not to.
+# ---------------------------------------------------------------------------
+SUBMIT="${SUBMIT:-1}"
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+    SUBMIT=0
+fi
+
+if [ "$SUBMIT" = "1" ]; then
+    # shellcheck source=../../orchestrate_slurm/slurm_lib.sh
+    source "$BASE_DIR/orchestrate_slurm/slurm_lib.sh"
+    RESULTS_PARTITION="${RESULTS_PARTITION:-$SLURM_PARTITION}"
+    preflight_slurm || exit 1
+
+    self_cmd="SUBMIT=0 EXP_ROOT='$EXP_ROOT' EXP_BASE_PREFIX='$EXP_BASE_PREFIX'"
+    self_cmd+=" VARIANT_TAGS='$VARIANT_TAGS' REFERENCE_TAGS='$REFERENCE_TAGS'"
+    self_cmd+=" MODEL_FLAG=$MODEL_FLAG DATASET=$DATASET GEN_AGG_METHOD=$GEN_AGG_METHOD"
+    self_cmd+=" SEEDS='$SEEDS' BUDGETS='$BUDGETS'"
+    self_cmd+=" DEPLOY_AGG_METHOD=$DEPLOY_AGG_METHOD"
+    self_cmd+=" DEPLOY_NUM_POISONED=$DEPLOY_NUM_POISONED DEPLOY_NUM_HONESTS=$DEPLOY_NUM_HONESTS"
+    self_cmd+=" OUT_ROOT='$OUT_ROOT' ./scripts/show_results/run_all_campaign.sh"
+
+    GPUS_PER_TASK=0 CPUS_PER_TASK="${CPUS_PER_TASK:-4}" MEM_PER_TASK="${MEM_PER_TASK:-8G}" \
+    TIME_PER_TASK="${TIME_PER_TASK:-00:20:00}" \
+        job=$(submit_job_slurm "$self_cmd" "campaign_results" "${RESULTS_DEPENDENCY:-}" "$RESULTS_PARTITION") || exit 1
+    echo "[SUBMIT] job $job on partition $RESULTS_PARTITION -> log: $LOG_DIR/campaign_results.log"
+    echo "[SUBMIT] results will land under $OUT_ROOT/{vs_budget,asr_dynamics}"
+    exit 0
 fi
 
 COMMON=(--exp-root "$EXP_ROOT" --exp-base-prefix "$EXP_BASE_PREFIX"
