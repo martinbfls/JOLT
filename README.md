@@ -149,7 +149,9 @@ Run from the repo root, after generating the configs. Every script supports `DRY
   ssh, one per machine, pool in `machines.txt`). Expert checkpoints (and GEN's `expert_retrain/`)
   go to each machine's `/Data/$USER/JOLT` instead of the quota-limited home, and every job
   reading an expert runs on the machine that trained it; all other results land in `~/JOLT` as
-  usual. Without `EXECUTOR=nfs` nothing changes.
+  usual. When that machine is busy, a reader goes to a free machine that first rsyncs the expert
+  from it (machine to machine; `NFS_SHARE_EXPERTS=0` to always wait instead). Without
+  `EXECUTOR=nfs` nothing changes.
   ```bash
   EXECUTOR=nfs ./orchestrate_slurm/orchestrate_runs_trigger_joint_paper_main_campaign_slurm.sh
   python3 orchestrate_student_machines/nfs_scheduler.py status        # progress, failures + logs

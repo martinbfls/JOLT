@@ -17,7 +17,10 @@ Checkpoint affinity -- why this is not just a job pool:
   * a train_expert job pins its checkpoint directory to the machine it runs on, and every later
     job whose config reads that directory (input_pths) is sent to that same machine. Pins are
     kept in $NFS_STATE_DIR/affinity.tsv across runs, so e.g. a later BOOTSTRAP_SKIP=1 run still
-    finds its checkpoints. Jobs reading no checkpoint (select_flips, train_user, plots) go
+    finds its checkpoints. With NFS_SHARE_EXPERTS=1 (default), a reader whose holder machines
+    are all busy instead goes to a free machine, which first rsyncs the checkpoint directory from
+    a holder (machine to machine, nothing through the home) and then becomes a holder too.
+    Jobs reading no checkpoint (select_flips, train_user, plots) go
     anywhere, preferably to machines no pinned job is waiting for.
 
 Subcommands (all read their settings from the environment, see Settings below):
@@ -60,6 +63,9 @@ IDLE_EXIT = float(os.environ.get("NFS_IDLE_EXIT", "900"))           # daemon exi
 LIVENESS_EVERY = float(os.environ.get("NFS_LIVENESS_EVERY", "300"))
 REPROBE_EVERY = float(os.environ.get("NFS_REPROBE_EVERY", "600"))
 PIN_DOWN_TIMEOUT = float(os.environ.get("NFS_PIN_DOWN_TIMEOUT", "1800"))  # pinned machine down
+# Copy an expert's checkpoints to a free machine (rsync, machine to machine) instead of waiting
+# for the machine that trained it. 0 = every reader of an expert runs on that one machine.
+SHARE_EXPERTS = os.environ.get("NFS_SHARE_EXPERTS", "1") != "0"
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]
 
 JOBS_DIR = os.path.join(STATE_DIR, "jobs")      # <id>.json, written once at submission
@@ -277,7 +283,7 @@ def load_affinity():
         for line in open(AFFINITY):
             parts = line.rstrip("\n").split("\t")
             if len(parts) == 2:
-                pins[parts[0]] = parts[1]
+                pins[parts[0]] = [m for m in parts[1].split(",") if m]
     except OSError:
         pass
     return pins
@@ -287,7 +293,7 @@ def save_affinity(pins):
     tmp = AFFINITY + ".tmp.%d" % os.getpid()
     with open(tmp, "w") as f:
         for k in sorted(pins):
-            f.write("%s\t%s\n" % (k, pins[k]))
+            f.write("%s\t%s\n" % (k, ",".join(pins[k])))
     os.replace(tmp, AFFINITY)
 
 
@@ -325,6 +331,7 @@ unset PYTHONPATH PYTHONHOME || true
 export JOLT_LOCAL_STORAGE={local_root}
 export JOLT_NFS_JOB_ID={id}
 mkdir -p "$JOLT_LOCAL_STORAGE" || finish 1
+{copy_line}
 echo "[nfs] job={id} name={name} node=$(hostname) python=$(command -v python) local_storage=$JOLT_LOCAL_STORAGE"
 (
 set -euo pipefail
@@ -333,6 +340,13 @@ set -euo pipefail
 rc=$?
 [ "$rc" -eq 0 ] && touch {done_file}
 finish "$rc"
+"""
+
+
+COPY_TEMPLATE = """echo "[nfs] rsync {src} -> {dst}"
+mkdir -p {dst} && rsync -a --delete -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new" {src} {dst} || finish 1
+touch {copied}
+echo "[nfs] copy done ($(du -sh {dst} | cut -f1))"
 """
 
 
@@ -398,11 +412,12 @@ class Daemon:
     # -- job lifecycle ----------------------------------------------------------------------
     def finish(self, jid, rc):
         st = self.state[jid]
+        self.register_copy(jid)
         if rc == 0:
             self.set_state(jid, state="ok", machine=st.get("machine"), rc=0)
             # The home's inode quota is finite: only failed jobs keep their run script.
             for f in (os.path.join(RC_DIR, str(jid)), os.path.join(RUN_DIR, "%d.sh" % jid),
-                      os.path.join(RUN_DIR, "%d.host" % jid)):
+                      os.path.join(RUN_DIR, "%d.host" % jid), os.path.join(RUN_DIR, "%d.copied" % jid)):
                 try:
                     os.remove(f)
                 except OSError:
@@ -517,12 +532,12 @@ class Daemon:
             if self.state.get(jid, {}).get("state") in FINAL + ("running",):
                 continue
             r = self.role(jid)
-            if r and r[1] in self.pins:
-                m = self.pins[r[1]]
-                d[m] = d.get(m, 0) + 1
+            if r and self.pins.get(r[1]):
+                for m in self.pins[r[1]]:
+                    d[m] = d.get(m, 0) + 1
         return d
 
-    def launch(self, jid, machine):
+    def launch(self, jid, machine, copy_key=None, copy_from=None):
         job = self.jobs[jid]
         q = shlex.quote
         script = RUN_TEMPLATE.format(
@@ -531,12 +546,18 @@ class Daemon:
             rcfile=q(os.path.join(RC_DIR, str(jid))),
             path_line=('export PATH=%s:"$PATH"' % q(job["path_prepend"])) if job.get("path_prepend") else "",
             local_root=q(LOCAL_ROOT), cmd=job["cmd"],
+            copy_line=(COPY_TEMPLATE.format(
+                src=q("%s:%s/%s/" % (copy_from, LOCAL_ROOT, copy_key)),
+                dst=q("%s/%s/" % (LOCAL_ROOT, copy_key)),
+                copied=q(os.path.join(RUN_DIR, "%d.copied" % jid)))
+                if copy_from else ""),
             done_file=q(job["done_file"]) if job.get("done_file") else "/dev/null")
         run_sh = os.path.join(RUN_DIR, "%d.sh" % jid)
         with open(run_sh, "w") as f:
             f.write(script)
         os.makedirs(os.path.dirname(job["log"]), exist_ok=True)
-        for stale in (os.path.join(RC_DIR, str(jid)), os.path.join(RUN_DIR, "%d.host" % jid)):
+        for stale in (os.path.join(RC_DIR, str(jid)), os.path.join(RUN_DIR, "%d.host" % jid),
+                      os.path.join(RUN_DIR, "%d.copied" % jid)):
             try:
                 os.remove(stale)
             except OSError:
@@ -554,8 +575,10 @@ class Daemon:
             if not os.path.exists(os.path.join(RUN_DIR, "%d.host" % jid)):   # never started
                 self.mark_down(machine, "launch failed: %s" % (err.strip() or out.strip())[-200:])
                 return False
-        self.set_state(jid, state="running", machine=machine, pid=pid, started=time.time())
-        log("job %d (%s) -> %s" % (jid, job["name"], machine))
+        self.set_state(jid, state="running", machine=machine, pid=pid, started=time.time(),
+                       copy_key=copy_key, copy_from=copy_from)
+        log("job %d (%s) -> %s%s" % (jid, job["name"], machine,
+                                     " (copying %s from %s)" % (copy_key, copy_from) if copy_from else ""))
         return True
 
     def dispatch(self, ready):
@@ -564,14 +587,22 @@ class Daemon:
                 if self.minfo.get(m, {}).get("up")}
         demand = self.demand()
         pins_per_machine = {}
-        for m in self.pins.values():
-            pins_per_machine[m] = pins_per_machine.get(m, 0) + 1
+        for holders in self.pins.values():
+            for m in holders:
+                pins_per_machine[m] = pins_per_machine.get(m, 0) + 1
         order = {m: i for i, m in enumerate(self.machines)}
         now = time.time()
+
+        def up(m):
+            return self.minfo.get(m, {}).get("up", False)
 
         def candidates(job):
             need_gpu = int(job.get("gpus") or 0) > 0
             return [m for m, n in free.items() if n > 0 and (not need_gpu or self.minfo[m]["gpus"] > 0)]
+
+        def fail(jid, reason):
+            self.set_state(jid, state="failed", reason=reason)
+            log("job %d (%s) failed: %s" % (jid, self.jobs[jid]["name"], reason))
 
         for jid in ready:
             job = self.jobs[jid]
@@ -579,49 +610,61 @@ class Daemon:
             if r is None:
                 continue        # config not there yet (generated upstream?) -- retry next tick
             role, key = r
-            target = None
-            if role == "producer" and key in self.pins and not self.minfo.get(self.pins[key], {}).get("up"):
-                # Retraining anyway: no reason to wait for the machine of a previous run.
-                log("re-pinning %s: %s is down" % (key, self.pins[key]))
-                del self.pins[key]
-                save_affinity(self.pins)
-            if key is not None and key in self.pins:
-                m = self.pins[key]
-                info = self.minfo.get(m, {})
-                if not info.get("up"):
-                    if m not in order or now - (info.get("down_since") or now) > PIN_DOWN_TIMEOUT:
-                        self.set_state(jid, state="failed", reason=(
-                            "checkpoints %s are on %s, which is unusable (%s)"
-                            % (key, m, info.get("why", "not in the machines file"))))
-                        log("job %d (%s) failed: %s" % (jid, job["name"], self.state[jid]["reason"]))
-                    continue
-                if m in candidates(job):
-                    target = m
+            cands = candidates(job)
+            target, copy_from = None, None
+            if role == "producer":
+                # A (re)trained trajectory: prefer a free machine already holding the key (its
+                # copy gets overwritten), else the least-loaded one. Other copies become stale.
+                holders = [m for m in self.pins.get(key, []) if m in cands]
+                if holders:
+                    target = holders[0]
+                elif cands:
+                    target = min(cands, key=lambda m: (pins_per_machine.get(m, 0), demand.get(m, 0), order[m]))
             elif role == "consumer":
-                self.set_state(jid, state="failed", reason=(
-                    "reads checkpoints %s, but no machine is known to hold them -- run their "
-                    "train_expert with EXECUTOR=nfs first, or copy them to %s/%s on a machine and "
-                    "`nfs_scheduler.py affinity --pin %s <machine>`" % (key, LOCAL_ROOT, key, key)))
-                log("job %d (%s) failed: no machine holds %s" % (jid, job["name"], key))
-                continue
-            else:
-                cands = candidates(job)
-                if cands:
-                    if role == "producer":   # a fresh trajectory: least-loaded machine
-                        target = min(cands, key=lambda m: (pins_per_machine.get(m, 0), demand.get(m, 0), order[m]))
-                    else:                    # keep pinned machines for their own jobs
-                        target = min(cands, key=lambda m: (demand.get(m, 0), order[m]))
+                holders = self.pins.get(key, [])
+                live = [m for m in holders if up(m)]
+                if not holders:
+                    fail(jid, "reads checkpoints %s, but no machine is known to hold them -- run their "
+                         "train_expert with EXECUTOR=nfs first, or copy them to %s/%s on a machine and "
+                         "`nfs_scheduler.py affinity --pin %s <machine>`" % (key, LOCAL_ROOT, key, key))
+                    continue
+                if not live:
+                    since = min((self.minfo.get(m, {}).get("down_since") or now) for m in holders)
+                    if now - since > PIN_DOWN_TIMEOUT or not any(m in order for m in holders):
+                        fail(jid, "checkpoints %s are only on %s, unusable" % (key, ",".join(holders)))
+                    continue
+                free_holders = [m for m in live if m in cands]
+                if free_holders:
+                    target = free_holders[0]
+                elif SHARE_EXPERTS and cands:
+                    target = min(cands, key=lambda m: (demand.get(m, 0), order[m]))
+                    copy_from = live[0]
+            elif cands:                      # no checkpoint: keep holders for their own readers
+                target = min(cands, key=lambda m: (demand.get(m, 0), order[m]))
             if target is None:
                 continue
-            if not self.launch(jid, target):
+            if not self.launch(jid, target, key if copy_from else None, copy_from):
                 free[target] = 0
                 continue
             free[target] -= 1
-            if role == "producer" and self.pins.get(key) != target:
-                self.pins[key] = target
-                pins_per_machine[target] = pins_per_machine.get(target, 0) + 1
-                save_affinity(self.pins)
-                log("pinned %s -> %s" % (key, target))
+            if role == "producer":
+                if self.pins.get(key) != [target]:
+                    self.pins[key] = [target]
+                    pins_per_machine[target] = pins_per_machine.get(target, 0) + 1
+                    save_affinity(self.pins)
+                    log("pinned %s -> %s" % (key, target))
+
+    def register_copy(self, jid):
+        """After a job that rsynced an expert: its machine now holds that expert too."""
+        st = self.state.get(jid, {})
+        key, machine = st.get("copy_key"), st.get("machine")
+        if not key or not os.path.exists(os.path.join(RUN_DIR, "%d.copied" % jid)):
+            return
+        holders = self.pins.setdefault(key, [])
+        if st.get("copy_from") in holders and machine not in holders:   # not re-trained meanwhile
+            holders.append(machine)
+            save_affinity(self.pins)
+            log("%s copied to %s (holders: %s)" % (key, machine, ",".join(holders)))
 
     # -- main loop --------------------------------------------------------------------------
     def run(self):
@@ -780,12 +823,14 @@ def cmd_affinity(a):
         if daemon_alive():
             raise SystemExit("stop the scheduler first (it owns affinity.tsv while running)")
         if a.pin:
-            pins[os.path.normpath(a.pin[0])] = a.pin[1]
+            pins.setdefault(os.path.normpath(a.pin[0]), [])
+            if a.pin[1] not in pins[os.path.normpath(a.pin[0])]:
+                pins[os.path.normpath(a.pin[0])].append(a.pin[1])
         for k in a.unpin or []:
             pins.pop(os.path.normpath(k), None)
         save_affinity(pins)
     for k in sorted(pins):
-        print("%s\t%s" % (k, pins[k]))
+        print("%s\t%s" % (k, ",".join(pins[k])))
 
 
 def cmd_clean(a):
@@ -829,12 +874,17 @@ def cmd_clean(a):
         print("\n(listing only: %s on each machine -- add --yes to delete)" % target)
         return
     pins = load_affinity()
-    dropped = [k for k, m in pins.items()
-               if m in done and (not sub or k == sub or k.startswith(sub + "/"))]
-    for k in dropped:
-        del pins[k]
+    dropped = 0
+    for k in list(pins):
+        if not sub or k == sub or k.startswith(sub + "/"):
+            kept = [m for m in pins[k] if m not in done]
+            dropped += len(pins[k]) - len(kept)
+            if kept:
+                pins[k] = kept
+            else:
+                del pins[k]
     save_affinity(pins)
-    print("dropped %d checkpoint pin(s)" % len(dropped))
+    print("dropped %d checkpoint copy record(s)" % dropped)
 
 
 def main():
