@@ -144,6 +144,23 @@ Run from the repo root, after generating the configs. Every script supports `DRY
   TAG=baseline ./orchestrate_student_machines/orchestrate_runs_paper_main_campaign_user.sh
   ./orchestrate_student_machines/kill_all.sh
   ```
+- Any Slurm script, whole pipeline, on the student machines: `EXECUTOR=nfs` swaps sbatch for
+  `orchestrate_student_machines/nfs_scheduler.py` (same afterok chain and log files, jobs over
+  ssh, one per machine, pool in `machines.txt`). Expert checkpoints (and GEN's `expert_retrain/`)
+  go to each machine's `/Data/$USER/JOLT` instead of the quota-limited home, and every job
+  reading an expert runs on the machine that trained it; all other results land in `~/JOLT` as
+  usual. Without `EXECUTOR=nfs` nothing changes.
+  ```bash
+  EXECUTOR=nfs ./orchestrate_slurm/orchestrate_runs_trigger_joint_paper_main_campaign_slurm.sh
+  python3 orchestrate_student_machines/nfs_scheduler.py status        # progress, failures + logs
+  python3 orchestrate_student_machines/nfs_scheduler.py probe         # usable machines
+  python3 orchestrate_student_machines/nfs_scheduler.py clean         # checkpoint size per machine
+  python3 orchestrate_student_machines/nfs_scheduler.py clean --yes   # delete them everywhere
+  python3 orchestrate_student_machines/nfs_scheduler.py stop --kill-jobs
+  ```
+  The scheduler daemon starts itself on the first submission and exits when idle; run the
+  launch from `tmux` so it survives logout. `clean --path out/checkpoints/r32p_cifar_1xs` narrows
+  the deletion.
 
 ## BackdoorBench detection (appendix)
 

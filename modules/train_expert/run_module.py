@@ -24,6 +24,7 @@ from modules.base_utils.util import (
     get_train_info,
     needs_big_ims,
     slurmify_path,
+    local_storage_path,
 )
 from modules.base_utils.experiment_tracker import ExperimentTracker
 
@@ -55,7 +56,7 @@ def run(experiment_name, module_name, **kwargs):
     epochs = args.get("epochs", None)
     optim_kwargs = args.get("optim_kwargs", {})
     scheduler_kwargs = args.get("scheduler_kwargs", {})
-    output_dir = slurmify_path(args["output_dir"], slurm_id)
+    output_dir = local_storage_path(slurmify_path(args["output_dir"], slurm_id))
     budget = args.get("budget", None)
     seed = args.get("seed", None)
     track_eval = args.get("track_eval", True)

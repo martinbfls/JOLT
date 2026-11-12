@@ -297,7 +297,7 @@ preflight_slurm || exit 1
 # partition, probe THAT partition with the CPU-only shape FLIPS jobs will actually request, so
 # a bad partition name / unusable account-partition pair is caught now instead of after 240
 # FLIPS submissions.
-if [ "$FLIPS_PARTITIONS" != "$SLURM_PARTITIONS" ]; then
+if [ "$EXECUTOR" = "slurm" ] && [ "$FLIPS_PARTITIONS" != "$SLURM_PARTITIONS" ]; then
     for _flips_partition in $FLIPS_PARTITIONS; do
         if ! sinfo -h -p "$_flips_partition" -o "%P" 2>/dev/null | grep -q .; then
             echo "[PREFLIGHT] FLIPS_PARTITIONS partition '$_flips_partition' unknown or unreachable" >&2
