@@ -51,6 +51,30 @@ def slurmify_path(path, slurm_id):
     return path if slurm_id is None else path.format(slurm_id)
 
 
+# Machine-local root for bulky, regenerable files (expert checkpoints). Set only by the NFS
+# executor (orchestrate_student_machines/nfs_scheduler.py), whose machines share a small home but
+# each have a large local disk. Unset -- Slurm, or any direct run -- leaves every path untouched.
+LOCAL_STORAGE_ENV = "JOLT_LOCAL_STORAGE"
+
+
+def local_storage_path(path):
+    """Re-roots a repo-relative path under $JOLT_LOCAL_STORAGE, or returns it unchanged if unset.
+
+    Only for files that a later job reads back on the SAME machine (expert checkpoints): the NFS
+    executor runs a train_expert and every job reading its checkpoints on one machine. Paths
+    outside the repo are left alone. Keeps the path's type and any "{}" placeholders.
+    """
+    root = os.environ.get(LOCAL_STORAGE_ENV)
+    if not root or path is None:
+        return path
+    p = str(path)
+    rel = os.path.relpath(p, os.getcwd()) if os.path.isabs(p) else os.path.normpath(p)
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        return path
+    out = os.path.join(root, rel)
+    return type(path)(out) if not isinstance(path, str) else out
+
+
 def extract_toml(experiment_name, module_name=None):
     relative_path = "experiments/" + experiment_name + "/config.toml"
     full_path = generate_full_path(relative_path)

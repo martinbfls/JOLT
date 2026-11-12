@@ -27,6 +27,7 @@ from modules.base_utils.util import (
     make_pbar,
     needs_big_ims,
     slurmify_path,
+    local_storage_path,
     clf_loss,
     clf_eval,
     softmax,
@@ -107,8 +108,8 @@ def run(experiment_name, module_name, **kwargs):
         "trigger_alignment", ["cos_target", "cos_source", "cos_delta_to_init"], ylabel="Cosine similarity",
     )
 
-    input_pths = args["input_pths"]
-    opt_pths = args["opt_pths"]
+    input_pths = local_storage_path(args["input_pths"])
+    opt_pths = local_storage_path(args["opt_pths"])
     expert_model_flag = args["expert_model"]
     dataset_flag = args["dataset"]
     clean_label = args["source_label"]
@@ -501,7 +502,8 @@ def run(experiment_name, module_name, **kwargs):
         drawn = random.sample(expert_pool, n_checkpoints_per_step)
         return [(checkpoint, _opt_state_to_device(opt_state_cpu, device)) for checkpoint, opt_state_cpu in drawn]
 
-    retrain_base_dir = Path(output_dir).parent / "expert_retrain"
+    # Read back only by this run, so machine-local under the NFS executor (no-op otherwise).
+    retrain_base_dir = local_storage_path(Path(output_dir).parent / "expert_retrain")
 
     def _retrain_expert_with_trigger(round_idx, it, remaining_iterations):
         nonlocal expert_starts, expert_opt_starts, expert_pool, pool_size, n_checkpoints_per_step
