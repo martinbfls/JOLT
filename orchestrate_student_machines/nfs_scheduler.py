@@ -19,7 +19,9 @@ Checkpoint affinity -- why this is not just a job pool:
     kept in $NFS_STATE_DIR/affinity.tsv across runs, so e.g. a later BOOTSTRAP_SKIP=1 run still
     finds its checkpoints. With NFS_SHARE_EXPERTS=1 (default), a reader whose holder machines
     are all busy instead goes to a free machine, which first rsyncs the checkpoint directory from
-    a holder (machine to machine, nothing through the home) and then becomes a holder too.
+    a holder and then becomes a holder too. The copy is relayed by the daemon
+    (`ssh src tar | ssh dst tar`, nothing written to the home): the machines authenticate with
+    Kerberos, which is not delegated from one machine to the next.
     Jobs reading no checkpoint (select_flips, train_user, plots) go
     anywhere, preferably to machines no pinned job is waiting for.
 
@@ -66,6 +68,10 @@ PIN_DOWN_TIMEOUT = float(os.environ.get("NFS_PIN_DOWN_TIMEOUT", "1800"))  # pinn
 # Copy an expert's checkpoints to a free machine (rsync, machine to machine) instead of waiting
 # for the machine that trained it. 0 = every reader of an expert runs on that one machine.
 SHARE_EXPERTS = os.environ.get("NFS_SHARE_EXPERTS", "1") != "0"
+# A machine whose GPU already has more memory than this in use (another user's job) is skipped
+# for GPU jobs and rechecked after NFS_REPROBE_EVERY.
+GPU_BUSY_MB = int(os.environ.get("NFS_GPU_BUSY_MB", "1500"))
+KINIT_RENEW_EVERY = float(os.environ.get("NFS_KINIT_RENEW_EVERY", "14400"))
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]
 
 JOBS_DIR = os.path.join(STATE_DIR, "jobs")      # <id>.json, written once at submission
@@ -331,7 +337,8 @@ unset PYTHONPATH PYTHONHOME || true
 export JOLT_LOCAL_STORAGE={local_root}
 export JOLT_NFS_JOB_ID={id}
 mkdir -p "$JOLT_LOCAL_STORAGE" || finish 1
-{copy_line}
+# Pretrained weights (e.g. lpips' AlexNet) cached per machine, not in the quota-limited home.
+export TORCH_HOME="$JOLT_LOCAL_STORAGE/torch_home"
 echo "[nfs] job={id} name={name} node=$(hostname) python=$(command -v python) local_storage=$JOLT_LOCAL_STORAGE"
 (
 set -euo pipefail
@@ -340,13 +347,6 @@ set -euo pipefail
 rc=$?
 [ "$rc" -eq 0 ] && touch {done_file}
 finish "$rc"
-"""
-
-
-COPY_TEMPLATE = """echo "[nfs] rsync {src} -> {dst}"
-mkdir -p {dst} && rsync -a --delete -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new" {src} {dst} || finish 1
-touch {copied}
-echo "[nfs] copy done ($(du -sh {dst} | cut -f1))"
 """
 
 
@@ -412,12 +412,11 @@ class Daemon:
     # -- job lifecycle ----------------------------------------------------------------------
     def finish(self, jid, rc):
         st = self.state[jid]
-        self.register_copy(jid)
         if rc == 0:
             self.set_state(jid, state="ok", machine=st.get("machine"), rc=0)
             # The home's inode quota is finite: only failed jobs keep their run script.
             for f in (os.path.join(RC_DIR, str(jid)), os.path.join(RUN_DIR, "%d.sh" % jid),
-                      os.path.join(RUN_DIR, "%d.host" % jid), os.path.join(RUN_DIR, "%d.copied" % jid)):
+                      os.path.join(RUN_DIR, "%d.host" % jid)):
                 try:
                     os.remove(f)
                 except OSError:
@@ -537,27 +536,71 @@ class Daemon:
                     d[m] = d.get(m, 0) + 1
         return d
 
+    def mark_busy(self, m, used):
+        info = self.minfo.setdefault(m, {"gpus": 0, "up": True})
+        info["busy_until"] = time.time() + REPROBE_EVERY
+        log("machine %s skipped for %ds: GPU already has %s MiB in use" % (m, REPROBE_EVERY, used))
+
+    def gpu_busy(self, m):
+        """Memory used on the machine's least-loaded GPU when above GPU_BUSY_MB, else None."""
+        rc, out, _ = ssh(m, "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | sort -n | head -1",
+                         timeout=30)
+        try:
+            used = int(out.strip())
+        except ValueError:
+            return None
+        return used if used > GPU_BUSY_MB else None
+
+    def copy_expert(self, key, src, dst, jid):
+        """Relays LOCAL_ROOT/key from src to dst through this host; dst becomes a holder."""
+        q = shlex.quote
+        root, tmp = LOCAL_ROOT, "%s/.incoming_%d" % (LOCAL_ROOT, jid)
+        send = "tar -C %s -cf - %s" % (q(root), q(key))
+        recv = ("rm -rf {t} && mkdir -p {t} && tar -C {t} -xf - && rm -rf {d} && mkdir -p {p} "
+                "&& mv {t}/{k} {d} && rm -rf {t}").format(
+            t=q(tmp), d=q("%s/%s" % (root, key)), p=q(os.path.dirname("%s/%s" % (root, key))), k=q(key))
+        ssh_cmd = " ".join(["ssh"] + [q(o) for o in SSH_OPTS])
+        pipeline = "set -o pipefail; %s %s %s | %s %s %s" % (ssh_cmd, q(src), q(send), ssh_cmd, q(dst), q(recv))
+        t0 = time.time()
+        try:
+            p = subprocess.run(["bash", "-c", pipeline], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=3600, universal_newlines=True)
+            ok, err = p.returncode == 0, p.stderr.strip()
+        except subprocess.TimeoutExpired:
+            ok, err = False, "timeout"
+        if not ok:
+            log("copy of %s %s -> %s FAILED: %s" % (key, src, dst, err[-300:]))
+            return False
+        holders = self.pins.setdefault(key, [])
+        if src in holders and dst not in holders:      # not re-trained meanwhile
+            holders.append(dst)
+            save_affinity(self.pins)
+        log("copied %s %s -> %s in %.0fs (holders: %s)" % (key, src, dst, time.time() - t0, ",".join(holders)))
+        return True
+
     def launch(self, jid, machine, copy_key=None, copy_from=None):
+        """False when the machine turned out unusable (down, or GPU taken by someone else)."""
         job = self.jobs[jid]
         q = shlex.quote
+        if int(job.get("gpus") or 0) > 0:
+            used = self.gpu_busy(machine)
+            if used is not None:
+                self.mark_busy(machine, used)
+                return False
+        if copy_from and not self.copy_expert(copy_key, copy_from, machine, jid):
+            return False
         script = RUN_TEMPLATE.format(
             id=jid, name=job["name"], log=q(job["log"]), cwd=q(job["cwd"]),
             hostfile=q(os.path.join(RUN_DIR, "%d.host" % jid)),
             rcfile=q(os.path.join(RC_DIR, str(jid))),
             path_line=('export PATH=%s:"$PATH"' % q(job["path_prepend"])) if job.get("path_prepend") else "",
             local_root=q(LOCAL_ROOT), cmd=job["cmd"],
-            copy_line=(COPY_TEMPLATE.format(
-                src=q("%s:%s/%s/" % (copy_from, LOCAL_ROOT, copy_key)),
-                dst=q("%s/%s/" % (LOCAL_ROOT, copy_key)),
-                copied=q(os.path.join(RUN_DIR, "%d.copied" % jid)))
-                if copy_from else ""),
             done_file=q(job["done_file"]) if job.get("done_file") else "/dev/null")
         run_sh = os.path.join(RUN_DIR, "%d.sh" % jid)
         with open(run_sh, "w") as f:
             f.write(script)
         os.makedirs(os.path.dirname(job["log"]), exist_ok=True)
-        for stale in (os.path.join(RC_DIR, str(jid)), os.path.join(RUN_DIR, "%d.host" % jid),
-                      os.path.join(RUN_DIR, "%d.copied" % jid)):
+        for stale in (os.path.join(RC_DIR, str(jid)), os.path.join(RUN_DIR, "%d.host" % jid)):
             try:
                 os.remove(stale)
             except OSError:
@@ -575,10 +618,9 @@ class Daemon:
             if not os.path.exists(os.path.join(RUN_DIR, "%d.host" % jid)):   # never started
                 self.mark_down(machine, "launch failed: %s" % (err.strip() or out.strip())[-200:])
                 return False
-        self.set_state(jid, state="running", machine=machine, pid=pid, started=time.time(),
-                       copy_key=copy_key, copy_from=copy_from)
+        self.set_state(jid, state="running", machine=machine, pid=pid, started=time.time())
         log("job %d (%s) -> %s%s" % (jid, job["name"], machine,
-                                     " (copying %s from %s)" % (copy_key, copy_from) if copy_from else ""))
+                                     " (expert copied from %s)" % copy_from if copy_from else ""))
         return True
 
     def dispatch(self, ready):
@@ -598,7 +640,8 @@ class Daemon:
 
         def candidates(job):
             need_gpu = int(job.get("gpus") or 0) > 0
-            return [m for m, n in free.items() if n > 0 and (not need_gpu or self.minfo[m]["gpus"] > 0)]
+            return [m for m, n in free.items() if n > 0 and (not need_gpu or (
+                self.minfo[m]["gpus"] > 0 and self.minfo[m].get("busy_until", 0) < now))]
 
         def fail(jid, reason):
             self.set_state(jid, state="failed", reason=reason)
@@ -654,24 +697,13 @@ class Daemon:
                     save_affinity(self.pins)
                     log("pinned %s -> %s" % (key, target))
 
-    def register_copy(self, jid):
-        """After a job that rsynced an expert: its machine now holds that expert too."""
-        st = self.state.get(jid, {})
-        key, machine = st.get("copy_key"), st.get("machine")
-        if not key or not os.path.exists(os.path.join(RUN_DIR, "%d.copied" % jid)):
-            return
-        holders = self.pins.setdefault(key, [])
-        if st.get("copy_from") in holders and machine not in holders:   # not re-trained meanwhile
-            holders.append(machine)
-            save_affinity(self.pins)
-            log("%s copied to %s (holders: %s)" % (key, machine, ",".join(holders)))
-
     # -- main loop --------------------------------------------------------------------------
     def run(self):
         log("daemon start on %s pid %d, state %s, local root %s, machines file %s"
             % (socket.gethostname(), os.getpid(), STATE_DIR, LOCAL_ROOT, MACHINES_FILE))
         self.reprobe(self.machines)
         self.last_reprobe = time.time()
+        last_kinit = time.time()
         while True:
             now = time.time()
             self.load_new_jobs()
@@ -685,6 +717,11 @@ class Daemon:
                 if down:
                     self.reprobe(down)
                 self.last_reprobe = now
+            if now - last_kinit > KINIT_RENEW_EVERY:
+                # ssh to the machines rides on this host's Kerberos ticket: keep it renewed.
+                subprocess.run(["kinit", "-R"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                last_kinit = now
             ready = self.resolve()
             self.dispatch(ready)
 
