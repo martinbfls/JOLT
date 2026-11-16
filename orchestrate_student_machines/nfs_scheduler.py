@@ -65,6 +65,9 @@ IDLE_EXIT = float(os.environ.get("NFS_IDLE_EXIT", "900"))           # daemon exi
 LIVENESS_EVERY = float(os.environ.get("NFS_LIVENESS_EVERY", "300"))
 REPROBE_EVERY = float(os.environ.get("NFS_REPROBE_EVERY", "600"))
 PIN_DOWN_TIMEOUT = float(os.environ.get("NFS_PIN_DOWN_TIMEOUT", "1800"))  # pinned machine down
+# A RUNNING job whose machine stays unreachable this long is declared lost (and its dependents
+# cancelled). Long on purpose: a GEN job runs ~3 h and keeps going through a ssh outage.
+LOST_TIMEOUT = float(os.environ.get("NFS_LOST_TIMEOUT", "7200"))
 # Copy an expert's checkpoints to a free machine (rsync, machine to machine) instead of waiting
 # for the machine that trained it. 0 = every reader of an expert runs on that one machine.
 SHARE_EXPERTS = os.environ.get("NFS_SHARE_EXPERTS", "1") != "0"
@@ -487,7 +490,7 @@ class Daemon:
                 continue
             since = st.setdefault("suspect_since", now)
             # dead: give NFS time to show the rc file; unreachable: the machine may come back.
-            limit = 180 if verdict == "dead" else PIN_DOWN_TIMEOUT
+            limit = 180 if verdict == "dead" else LOST_TIMEOUT
             if now - since > limit:
                 self.set_state(jid, state="failed", machine=st["machine"], rc=None,
                                reason="lost (%s, no exit code)" % verdict)
