@@ -27,7 +27,7 @@ for module_name, module_config in args.items():
 
     if not os.path.exists(full_path):
         print(f"Malformed module! Module {module_name} does not exist!")
-        exit()
+        sys.exit(1)
 
     schema = toml.load(full_path, _dict=OrderedDict)
 
@@ -37,7 +37,7 @@ for module_name, module_config in args.items():
         validate_module_config(module_name, module_config)
     except ConfigValidationError as e:
         print(f"Malformed config: {e}")
-        exit()
+        sys.exit(1)
 
     if 'INTERNAL' in schema:
         resolves_to[module_name] = schema['INTERNAL']['module_name']
