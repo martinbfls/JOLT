@@ -171,6 +171,17 @@ def run(experiment_name, module_name, **kwargs):
     lr_delta = args.get("lr_delta", 1e-2)
     # the control grid lives in pixels, on a different scale than the additive delta in [0, 1]
     lr_warp = args.get("lr_warp", 1e-1)
+    # photometric half of the hybrid trigger: per-channel contrast (gain = 1 + a, |a| <= photo_contrast)
+    # and brightness (shift b, |b| <= photo_brightness), applied between the warp and the additive delta.
+    # Both budgets at 0 (default) = off, the trigger is then exactly the warp + additive one.
+    photo_contrast = args.get("photo_contrast", 0.0)
+    photo_brightness = args.get("photo_brightness", 0.0)
+    lr_photo = args.get("lr_photo", 1e-2)
+    has_photo = photo_contrast > 0 or photo_brightness > 0
+    if has_photo and not is_hybrid:
+        raise ValueError(
+            f"photo_contrast/photo_brightness need trigger_type='hybrid', got {trigger_type!r}"
+        )
     lambda_bd = args.get("lambda_bd", 1.0)
     lambda_joint = args.get("lambda_joint", 0.0)
     track_joint = lambda_joint != 0
@@ -330,11 +341,13 @@ def run(experiment_name, module_name, **kwargs):
         )
     )
 
-    def apply_trigger(x_raw, d, cg):
-        """Preprocessed triggered images for the optimized variables: the additive delta `d` and
-        the warp control grid `cg` (each None when its component is off; see apply_trigger_raw)."""
+    def apply_trigger(x_raw, d, cg, ph=None):
+        """Preprocessed triggered images for the optimized variables: the additive delta `d`, the
+        warp control grid `cg` and the photometric (2, C) tensor `ph` (each None when its component
+        is off; see apply_trigger_raw)."""
         return raw_to_trigger_preprocess(
             x_raw, d, dataset_flag=dataset_flag, model_flag=expert_model_flag, control_grid=cg, s=warp_s,
+            photo=ph,
         )
 
     def trigger_artifact():
@@ -350,9 +363,15 @@ def run(experiment_name, module_name, **kwargs):
         }
         if has_additive:
             artifact["delta"] = delta_add.detach().cpu()
+        if has_photo:
+            artifact["photo"] = photo.detach().cpu()
+            artifact["photo_contrast"] = photo_contrast
+            artifact["photo_brightness"] = photo_brightness
         return artifact
 
     warp_grid = init_warp_field(warp_k, warp_s, device=device) if has_warp else None
+    # (2, C): row 0 contrast deviation, row 1 brightness shift; starts at 0 = identity
+    photo = torch.zeros(2, mu.shape[0], device=device) if has_photo else None
     delta_add = (
         init_delta(
             mu.shape,
@@ -369,7 +388,8 @@ def run(experiment_name, module_name, **kwargs):
     # to -- the additive perturbation whenever there is one, the control grid under the warp-only
     # trigger (where it is the single optimized variable, as before this file knew about 'hybrid').
     delta = delta_add if has_additive else warp_grid
-    trigger_vars = [v for v in (delta_add, warp_grid) if v is not None]
+    trigger_vars = [v for v in (delta_add, warp_grid, photo) if v is not None]
+    warp_var_idx = next(i for i, v in enumerate(trigger_vars) if v is warp_grid) if has_warp else None
 
     def accumulate_trigger_grad(loss, weight, extra_targets=(), create_graph=False):
         """Adds weight * dloss/dv into every trigger variable's own .grad -- the manual,
@@ -409,9 +429,10 @@ def run(experiment_name, module_name, **kwargs):
     if is_hybrid:
         # one Adam over both components, each with its own learning rate (they live on different
         # scales: [0, 1] intensity for delta, pixels for the control grid)
-        optimizer_delta = torch.optim.Adam(
-            [{"params": [delta_add], "lr": lr_delta}, {"params": [warp_grid], "lr": lr_warp}]
-        )
+        param_groups = [{"params": [delta_add], "lr": lr_delta}, {"params": [warp_grid], "lr": lr_warp}]
+        if has_photo:
+            param_groups.append({"params": [photo], "lr": lr_photo})
+        optimizer_delta = torch.optim.Adam(param_groups)
     else:
         optimizer_delta = torch.optim.Adam([delta], lr=lr_warp if has_warp else lr_delta)
 
@@ -455,6 +476,7 @@ def run(experiment_name, module_name, **kwargs):
     delta_init = None
     delta_add_init = None
     warp_grid_init = None
+    photo_init = None
     prev_delta_sign = None
 
     expert_pool = None
@@ -513,6 +535,9 @@ def run(experiment_name, module_name, **kwargs):
             norms.append(f"||delta||_inf={delta_add.abs().max().item():.4f}")
         if has_warp:
             norms.append(f"||control_grid||_inf={warp_grid.abs().max().item():.4f}")
+        if has_photo:
+            norms.append(f"|contrast|_max={photo[0].abs().max().item():.4f}, "
+                         f"|brightness|_max={photo[1].abs().max().item():.4f}")
         print(
             f"[expert_retrain] round {round_idx}: retraining a fresh expert for "
             f"{expert_retrain_epochs} epochs against the CURRENT trigger ({', '.join(norms)})..."
@@ -722,7 +747,7 @@ def run(experiment_name, module_name, **kwargs):
                             if is_poisoned.any():
                                 idx_poisoned = idx[is_poisoned].tolist()
                                 x_raw_adv = _raw_poison_batch(idx_poisoned)
-                                x_trig = apply_trigger(x_raw_adv, delta_add, warp_grid)
+                                x_trig = apply_trigger(x_raw_adv, delta_add, warp_grid, photo)
                                 x_t_adv = x_t.clone()
 
                                 x_t_adv[is_poisoned_dev] = x_trig
@@ -788,7 +813,7 @@ def run(experiment_name, module_name, **kwargs):
                                 if lpips_model is not None:
                                     L_lpips_cid = lpips_penalty(
                                         x_raw_adv, lpips_model, delta=delta_add,
-                                        control_grid=warp_grid, warp_s=warp_s,
+                                        control_grid=warp_grid, warp_s=warp_s, photo=photo,
                                     )
                                     accumulate_trigger_grad(
                                         L_lpips_cid, lambda_lpips / n_checkpoints_per_step,
@@ -965,7 +990,7 @@ def run(experiment_name, module_name, **kwargs):
                     for v, g_manual in zip(trigger_vars, manual_only_grads)
                 ]
                 mtt_delta_grad_norm = mtt_trigger_grad_norms[0]
-                mtt_warp_grad_norm = mtt_trigger_grad_norms[-1] if has_warp else 0.0
+                mtt_warp_grad_norm = mtt_trigger_grad_norms[warp_var_idx] if has_warp else 0.0
 
                 optimizer_labels.step()
                 optimizer_delta.step()
@@ -978,6 +1003,9 @@ def run(experiment_name, module_name, **kwargs):
                             delta.clamp_(-epsilon, epsilon)
                     if has_warp:
                         warp_grid.clamp_(-warp_s, warp_s)
+                    if has_photo:
+                        photo[0].clamp_(-photo_contrast, photo_contrast)
+                        photo[1].clamp_(-photo_brightness, photo_brightness)
 
                 for m in expert_models:
                     m.eval()
@@ -1012,6 +1040,7 @@ def run(experiment_name, module_name, **kwargs):
                     if just_captured:
                         delta_add_init = delta_add.detach().clone() if has_additive else None
                         warp_grid_init = warp_grid.detach().clone() if has_warp else None
+                        photo_init = photo.detach().clone() if has_photo else None
                         delta_init = delta_add_init if has_additive else warp_grid_init
                     cos_to_init = cosine_to(delta, delta_init).item()
                     delta_drift_l2 = (delta - delta_init).norm().item()
@@ -1021,8 +1050,8 @@ def run(experiment_name, module_name, **kwargs):
                             f"delta_drift_l2={delta_drift_l2} -- expected exactly 1.0/0.0."
                         )
 
-                    x_trig_eval = apply_trigger(asr_eval_raw, delta_add, warp_grid)
-                    x_trig_eval_frozen = apply_trigger(asr_eval_raw, delta_add_init, warp_grid_init)
+                    x_trig_eval = apply_trigger(asr_eval_raw, delta_add, warp_grid, photo)
+                    x_trig_eval_frozen = apply_trigger(asr_eval_raw, delta_add_init, warp_grid_init, photo_init)
                     asr_mean_list = [
                         (m(x_trig_eval).argmax(dim=1) == target_label).float().mean().item() for m in expert_models
                     ]
@@ -1082,6 +1111,9 @@ def run(experiment_name, module_name, **kwargs):
                     "lambda_lpips_current": lambda_lpips,
                     "lambda_consistency_current": lambda_consistency,
                 }
+                if has_photo:
+                    step_metrics["photo_contrast_abs"] = photo[0].abs().max().item()
+                    step_metrics["photo_brightness_abs"] = photo[1].abs().max().item()
                 if history is not None:
                     history.append({"it": it, **step_metrics})
                 tracker.log(global_step, **step_metrics)
@@ -1109,6 +1141,9 @@ def run(experiment_name, module_name, **kwargs):
                 if is_hybrid:  # the warp half, alongside delta_linf/mtt_grad for the additive one
                     postfix["warp_linf"] = f"{warp_linf:.4g}"
                     postfix["mtt_warp_grad"] = f"{mtt_warp_grad_norm:.4g}"
+                if has_photo:
+                    postfix["photo_c"] = f"{photo[0].abs().max().item():.3g}"
+                    postfix["photo_b"] = f"{photo[1].abs().max().item():.3g}"
                 pbar.set_postfix(**postfix)
 
     # Save results

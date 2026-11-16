@@ -63,6 +63,13 @@ export LAMBDA_LPIPS="${LAMBDA_LPIPS:-0.0}"
 export WARP_K="${WARP_K:-4}"
 export LR_WARP="${LR_WARP:-0.1}"
 export LR_DELTA="${LR_DELTA:-}"   # empty leaves gen_configs.py's own default (1e-2)
+# Photometric half (per-channel contrast/brightness budgets); empty/0 = off. TAG_SUFFIX is appended
+# to each cell's VARIANT_TAG (e.g. TAG_SUFFIX=_photo) so a run that differs only by these knobs gets
+# its own experiments/out/checkpoints subtree and job names instead of colliding with the plain one.
+export PHOTO_CONTRAST="${PHOTO_CONTRAST:-}"
+export PHOTO_BRIGHTNESS="${PHOTO_BRIGHTNESS:-}"
+export LR_PHOTO="${LR_PHOTO:-}"
+TAG_SUFFIX="${TAG_SUFFIX:-}"
 # 1 = federated victim with the same optimizer-step count as the centralized one
 export SPLIT_BATCH="${SPLIT_BATCH:-0}"
 
@@ -107,7 +114,7 @@ TAGS=()
 
 for epsilon in "${EPSILON_ARR[@]}"; do
     for warp_s in "${WARP_S_ARR[@]}"; do
-        tag="hybrid_eps$(sanitize "$epsilon")_s$(sanitize "$warp_s")"
+        tag="hybrid_eps$(sanitize "$epsilon")_s$(sanitize "$warp_s")${TAG_SUFFIX}"
         TAGS+=("$tag")
         for seed in "${SEEDS_ARR[@]}"; do
             echo "[SWEEP] submitting cell: epsilon=$epsilon warp_s=$warp_s seed=$seed -> VARIANT_TAG=$tag"

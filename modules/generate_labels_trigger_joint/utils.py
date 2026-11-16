@@ -161,14 +161,14 @@ def poison_consistency(poison_grad_chunks, eps=1e-8):
     return 1.0 - F.cosine_similarity(G, g_bar.unsqueeze(0).expand_as(G), dim=1, eps=eps).mean()
 
 
-def lpips_penalty(x_raw_clean, lpips_model, delta=None, control_grid=None, warp_s=1.0):
+def lpips_penalty(x_raw_clean, lpips_model, delta=None, control_grid=None, warp_s=1.0, photo=None):
     """Perceptual (LPIPS) distance between the clean raw image(s) and their triggered counterpart,
     differentiable w.r.t. whichever trigger variables are passed: the pixel delta under
     trigger_type='additive', the warp control grid under 'warp', both composed under 'hybrid'
     (see apply_trigger_raw, modules/optimizing_trigger/utils.py, for the composition)."""
     from modules.optimizing_trigger.utils import apply_trigger_raw
 
-    x_trig_raw = apply_trigger_raw(x_raw_clean, delta, control_grid, warp_s)
+    x_trig_raw = apply_trigger_raw(x_raw_clean, delta, control_grid, warp_s, photo)
     x_clean_scaled = x_raw_clean * 2 - 1
     x_trig_scaled = x_trig_raw * 2 - 1
     return lpips_model(x_trig_scaled, x_clean_scaled).mean()

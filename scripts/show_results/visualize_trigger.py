@@ -101,7 +101,13 @@ def main():
         ax.set_aspect("equal")
         ax.invert_yaxis()
 
-    fig.suptitle(f"{args.model_flag}/{args.dataset} seed{args.seed} -- {args.trigger_type} trigger")
+    title = f"{args.model_flag}/{args.dataset} seed{args.seed} -- {args.trigger_type} trigger"
+    photo = saved.get("photo") if saved is not None else None  # (2, C): contrast deviation, brightness shift
+    if photo is not None:
+        c, b = photo[0].tolist(), photo[1].tolist()
+        title += ("\ncontrast gain " + ", ".join(f"{1 + v:.3f}" for v in c)
+                  + " | brightness shift " + ", ".join(f"{v:+.3f}" for v in b) + " (R, G, B)")
+    fig.suptitle(title)
     fig.tight_layout()
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=150)

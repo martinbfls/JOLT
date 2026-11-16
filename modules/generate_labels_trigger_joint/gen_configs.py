@@ -102,6 +102,12 @@ TRIGGER_TYPE = "additive"
 WARP_K = 4
 WARP_S = 1.0
 LR_WARP = 0.1
+# Photometric half of the hybrid trigger (per-channel contrast gain 1+a, |a| <= PHOTO_CONTRAST, and
+# brightness shift b, |b| <= PHOTO_BRIGHTNESS, between the warp and the additive delta). Both 0 =
+# off: the configs are then written without these keys, byte-identical to before.
+PHOTO_CONTRAST = 0.0
+PHOTO_BRIGHTNESS = 0.0
+LR_PHOTO = 0.01
 
 LAMBDA_GRADMATCH = 1.0
 GRADMATCH_EPS = 1e-8
@@ -265,6 +271,20 @@ def cell_name(model_flag, dataset, agg_method, seed):
     return f"{model_flag}/{dataset}/{NUM_POISONED}vs{NUM_HONESTS}/{agg_method}/seed{seed}"
 
 
+def _with_photo(content, photo_contrast, photo_brightness, lr_photo):
+    """Adds the photometric keys after `lr_warp` in a generated generate_labels_trigger_joint config.
+    Both budgets at 0 (off) leave the config untouched, so non-photometric configs are unchanged."""
+    if not (photo_contrast or photo_brightness):
+        return content
+    marker = "lr_warp = "
+    start = content.index(marker)
+    end = content.index("\n", start) + 1
+    block = (f"photo_contrast = {photo_contrast}\n"
+             f"photo_brightness = {photo_brightness}\n"
+             f"lr_photo = {lr_photo}\n")
+    return content[:end] + block + content[end:]
+
+
 def _poisoner_for(trigger_type):
     """train_user's poisoner flag for this trigger_type (see POISONER_BY_TRIGGER_TYPE)."""
     if trigger_type not in POISONER_BY_TRIGGER_TYPE:
@@ -374,6 +394,9 @@ def generate_cell(
     warp_k=None,
     warp_s=None,
     lr_warp=None,
+    photo_contrast=None,
+    photo_brightness=None,
+    lr_photo=None,
     checkpoint_tag=None,
     lambda_bd=None,
     lambda_joint=None,
@@ -389,6 +412,11 @@ def generate_cell(
     warp_k = WARP_K if warp_k is None else warp_k
     warp_s = WARP_S if warp_s is None else warp_s
     lr_warp = LR_WARP if lr_warp is None else lr_warp
+    photo_contrast = PHOTO_CONTRAST if photo_contrast is None else photo_contrast
+    photo_brightness = PHOTO_BRIGHTNESS if photo_brightness is None else photo_brightness
+    lr_photo = LR_PHOTO if lr_photo is None else lr_photo
+    if (photo_contrast or photo_brightness) and trigger_type != "hybrid":
+        raise ValueError("--photo-contrast/--photo-brightness need --trigger-type hybrid")
     poisoner = _poisoner_for(trigger_type)
     ckpt_subdir = f"{model_flag}_1xs" if checkpoint_tag is None else f"{model_flag}_1xs_{checkpoint_tag}"
 
@@ -448,7 +476,7 @@ def generate_cell(
                 group=model_flag,
             ),
         ),
-        module_dir / "config.toml": JOINT_TRIGGER_TEMPLATE.format(
+        module_dir / "config.toml": _with_photo(JOINT_TRIGGER_TEMPLATE.format(
             cluster_root=CLUSTER_ROOT,
             ckpt_subdir=ckpt_subdir,
             model_flag=model_flag,
@@ -502,7 +530,7 @@ def generate_cell(
                 entity=WANDB_ENTITY,
                 group=model_flag,
             ),
-        ),
+        ), photo_contrast, photo_brightness, lr_photo),
         flips_dir / "config.toml": SELECT_FLIPS_TEMPLATE.format(
             budgets=budgets,
             module_dir=module_dir,
@@ -657,6 +685,13 @@ if __name__ == "__main__":
     parser.add_argument("--warp-k", type=int, default=None, help="override WARP_K (warp control-grid side)")
     parser.add_argument("--warp-s", type=float, default=None, help="override WARP_S (max warp displacement, px)")
     parser.add_argument("--lr-warp", type=float, default=None, help="override LR_WARP")
+    parser.add_argument("--photo-contrast", type=float, default=None,
+                        help="override PHOTO_CONTRAST: budget of the per-channel contrast half of the "
+                             "hybrid trigger (gain 1+a, |a| <= this). 0 = off.")
+    parser.add_argument("--photo-brightness", type=float, default=None,
+                        help="override PHOTO_BRIGHTNESS: budget of the per-channel brightness half of "
+                             "the hybrid trigger (shift b, |b| <= this, in [0, 1] intensity). 0 = off.")
+    parser.add_argument("--lr-photo", type=float, default=None, help="override LR_PHOTO")
     parser.add_argument(
         "--epsilon",
         type=float,
@@ -763,6 +798,12 @@ if __name__ == "__main__":
         WARP_S = args.warp_s
     if args.lr_warp is not None:
         LR_WARP = args.lr_warp
+    if args.photo_contrast is not None:
+        PHOTO_CONTRAST = args.photo_contrast
+    if args.photo_brightness is not None:
+        PHOTO_BRIGHTNESS = args.photo_brightness
+    if args.lr_photo is not None:
+        LR_PHOTO = args.lr_photo
     if args.epsilon is not None:
         EPSILON = args.epsilon
     if args.lr_delta is not None:

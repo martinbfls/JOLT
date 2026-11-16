@@ -239,11 +239,13 @@ def raw_to_preprocess(x_raw: torch.Tensor, dataset_flag: str, model_flag: str = 
 
 def raw_to_trigger_preprocess(x_raw: torch.Tensor, delta: torch.Tensor,
                                dataset_flag: str, model_flag: str = None,
-                               control_grid: torch.Tensor = None, s: float = 1.0):
+                               control_grid: torch.Tensor = None, s: float = 1.0,
+                               photo: torch.Tensor = None):
     """Preprocessed triggered images. `delta` (additive perturbation) and `control_grid` (warp
     displacement field) are composed by apply_warp/apply_trigger_raw; either may be None, both
-    together give the hybrid trigger."""
-    x_trig = apply_trigger_raw(x_raw, delta, control_grid, s)
+    together give the hybrid trigger. `photo` is the optional photometric half (see
+    apply_photometric)."""
+    x_trig = apply_trigger_raw(x_raw, delta, control_grid, s, photo)
     return raw_to_preprocess(x_trig, dataset_flag, model_flag)
 
 
@@ -267,23 +269,41 @@ def apply_warp(x_raw: torch.Tensor, control_grid: torch.Tensor, s: float):
     return warped.squeeze(0) if squeeze else warped
 
 
+def apply_photometric(x_raw: torch.Tensor, photo: torch.Tensor):
+    """Per-channel contrast/brightness of x_raw ((C, H, W) or (B, C, H, W), in [0, 1]). `photo` is a
+    (2, C) tensor: row 0 the contrast deviation (gain = 1 + photo[0]), row 1 the brightness shift,
+    applied as gain * (x - 0.5) + 0.5 + shift. The result is NOT clamped (apply_trigger_raw does it
+    once at the end); photo = 0 is the identity."""
+    shape = (-1, 1, 1) if x_raw.dim() == 3 else (1, -1, 1, 1)
+    gain = (1.0 + photo[0]).view(shape).to(x_raw.dtype)
+    shift = photo[1].view(shape).to(x_raw.dtype)
+    return gain * (x_raw - 0.5) + 0.5 + shift
+
+
 def apply_trigger_raw(x_raw: torch.Tensor, delta: torch.Tensor = None,
-                      control_grid: torch.Tensor = None, s: float = 1.0):
+                      control_grid: torch.Tensor = None, s: float = 1.0,
+                      photo: torch.Tensor = None):
     """The composed trigger in RAW [0, 1] space -- single source of truth for the composition
     order, shared by the optimizer (generate_labels_trigger_joint), the LPIPS penalty and the
     deploy-time poisoners (modules/base_utils/datasets.py):
 
-        clamp(apply_warp(x_raw, control_grid, s) + delta, 0, 1)
+        clamp(apply_photometric(apply_warp(x_raw, control_grid, s), photo) + delta, 0, 1)
 
-    Either component may be None: `control_grid=None` gives the pure additive trigger
+    `photo` (optional, trigger_type='hybrid' only) is the per-channel contrast/brightness half. None
+    skips it; all-zeros neutralizes it (identity up to ~3e-8 float rounding), reproducing the warp +
+    additive trigger. Either component may be None: `control_grid=None` gives the pure additive trigger
     (trigger_type='additive'), `delta=None` the pure warp ('warp', apply_warp alone -- it needs
     no clamp, grid_sample interpolating an in-range image stays in range), both the hybrid one
     ('hybrid'). The warp comes FIRST so the additive pattern lands unaltered on top of the warped
     image: ||.||_inf of the additive component in the final image is then exactly ||delta||_inf,
     and each component zeroed out reduces the hybrid trigger exactly to the other one."""
     x_trig = x_raw if control_grid is None else apply_warp(x_raw, control_grid, s)
+    if photo is not None:
+        x_trig = apply_photometric(x_trig, photo)
     if delta is not None:
-        x_trig = (x_trig + (delta if x_trig.dim() == 3 else delta.unsqueeze(0))).clamp(0, 1)
+        x_trig = x_trig + (delta if x_trig.dim() == 3 else delta.unsqueeze(0))
+    if delta is not None or photo is not None:
+        x_trig = x_trig.clamp(0, 1)
     return x_trig
 
 

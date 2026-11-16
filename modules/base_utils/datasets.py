@@ -437,12 +437,16 @@ class WarpPoisoner(Poisoner):
 class HybridPoisoner(Poisoner):
     """The warp and the additive perturbation composed (trigger_type='hybrid'). `trigger` is the
     dict saved by generate_labels_trigger_joint: {"delta" (C, H, W), "control_grid" (1, 2, k, k)
-    in pixels, "warp_k", "warp_s"}; the composition order lives in apply_trigger_raw."""
+    in pixels, "warp_k", "warp_s", and optionally "photo" (2, C)}; the composition order lives in
+    apply_trigger_raw."""
     def __init__(self, trigger: dict):
         self.perturbation = trigger["delta"].detach()
         self.control_grid = trigger["control_grid"].detach()
         self.k = trigger["warp_k"]
         self.s = trigger["warp_s"]
+        # optional photometric half, (2, C): per-channel contrast deviation and brightness shift
+        photo = trigger.get("photo")
+        self.photo = None if photo is None else photo.detach()
 
     def poison(self, x: Image.Image) -> Image.Image:
         from modules.optimizing_trigger.utils import apply_trigger_raw  # local: utils imports this module
@@ -458,7 +462,7 @@ class HybridPoisoner(Poisoner):
                 align_corners=False
             ).squeeze(0)
 
-        poisoned_tensor = apply_trigger_raw(x_tensor, delta, self.control_grid, self.s)
+        poisoned_tensor = apply_trigger_raw(x_tensor, delta, self.control_grid, self.s, self.photo)
         return transforms.ToPILImage()(poisoned_tensor)
 
 
