@@ -12,7 +12,8 @@ per machine at a time.
 Checkpoint affinity -- why this is not just a job pool:
   * every job runs with JOLT_LOCAL_STORAGE=$NFS_LOCAL_ROOT (default /Data/$USER/JOLT), so
     train_expert writes its checkpoints, and generate_labels[_trigger_joint] reads them (and
-    writes its expert_retrain/ rounds), on the machine's local disk instead of the shared home
+    writes its expert_retrain/ checkpoints, overwritten every round), on the machine's local
+    disk instead of the shared home
     (see modules/base_utils/util.py:local_storage_path -- a no-op when the variable is unset);
   * a train_expert job pins its checkpoint directory to the machine it runs on, and every later
     job whose config reads that directory (input_pths) is sent to that same machine. Pins are

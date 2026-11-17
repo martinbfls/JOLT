@@ -49,12 +49,15 @@ SOURCE_LABEL = 9
 TARGET_LABEL = 4
 
 # This module's own default; a cross-module comparison must set both generators the same way.
-CHECKPOINT_SAMPLING = "biased"
+# "uniform": every outer step draws its expert checkpoints uniformly over the WHOLE trajectory
+# (epochs 1..EPOCHS_EXPERT, see expert_config's max below), not biased toward its start.
+CHECKPOINT_SAMPLING = "uniform"
 INDIRECT_MODULE_CHECKPOINT_SAMPLING = "uniform"
 
 ALPHA_CKPT = 0.01
 TRAIN_PCT = 1.0
-EPOCHS_EXPERT = 20
+# The full schedule (lr milestones [75, 125]), for the clean expert and every retraining round alike.
+EPOCHS_EXPERT = 200
 CHECKPOINT_ITERS = 50
 N_ITERATIONS = 25
 
@@ -217,11 +220,12 @@ expert_retrain_scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
 seed = {rng_seed}
 
 n_checkpoints_per_step = {n_checkpoints_per_step}
+resume_state_path = "{cell_dir}/resume/state.pt"
 {wandb_block_module}
 [generate_labels_trigger_joint.expert_config]
 experts = 1
 min = 0
-max = 20
+max = {expert_max_epoch}
 trajectories = [50, 100, 150, 200]
 
 [generate_labels_trigger_joint.attack_config]
@@ -518,6 +522,7 @@ def generate_cell(
             expert_retrain_epochs=EXPERT_RETRAIN_EPOCHS,
             expert_retrain_checkpoint_iters=EXPERT_RETRAIN_CHECKPOINT_ITERS,
             n_checkpoints_per_step=N_CHECKPOINTS_PER_STEP,
+            expert_max_epoch=min(EPOCHS_EXPERT, EXPERT_RETRAIN_EPOCHS),
             lr=lr,
             wd=wd,
             milestones=milestones,

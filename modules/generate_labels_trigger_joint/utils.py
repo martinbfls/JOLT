@@ -8,8 +8,20 @@ from modules.base_utils.datasets import MTTDataset
 from modules.federated_generate_labels.utils import DEFAULT_EXPERT_CONFIG
 
 
+def load_expert_pool(pool_paths):
+    """Loads the (params, optimizer-state) checkpoint pairs at `pool_paths` into RAM (float32, CPU)."""
+    return [
+        (
+            {k: v.float().cpu() for k, v in torch.load(p_path, map_location="cpu").items()},
+            torch.load(o_path, map_location="cpu"),
+        )
+        for p_path, o_path in pool_paths
+    ]
+
+
 def build_expert_pool(expert_starts, expert_opt_starts, pool_size):
-    """Preloads `pool_size` distinct (params, optimizer-state) checkpoint pairs into RAM, drawn from uniformly per step."""
+    """Preloads `pool_size` distinct (params, optimizer-state) checkpoint pairs into RAM, drawn from uniformly per step.
+    Returns (pool, pool_size, pool_paths), pool_paths being the [(params_path, opt_path), ...] loaded."""
     all_pairs = list(dict.fromkeys(zip(expert_starts, expert_opt_starts)))
     if pool_size > len(all_pairs):
         print(
@@ -18,14 +30,7 @@ def build_expert_pool(expert_starts, expert_opt_starts, pool_size):
         )
         pool_size = len(all_pairs)
     pool_paths = random.sample(all_pairs, pool_size)
-    pool = [
-        (
-            {k: v.float().cpu() for k, v in torch.load(p_path, map_location="cpu").items()},
-            torch.load(o_path, map_location="cpu"),
-        )
-        for p_path, o_path in pool_paths
-    ]
-    return pool, pool_size
+    return load_expert_pool(pool_paths), pool_size, pool_paths
 
 
 class TriggerMTTDataset(MTTDataset):
