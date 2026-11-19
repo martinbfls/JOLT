@@ -70,6 +70,10 @@ export PHOTO_CONTRAST="${PHOTO_CONTRAST:-}"
 export PHOTO_BRIGHTNESS="${PHOTO_BRIGHTNESS:-}"
 export LR_PHOTO="${LR_PHOTO:-}"
 TAG_SUFFIX="${TAG_SUFFIX:-}"
+# Expert epoch count / LR-drop epochs (exported to each cell), e.g. EXPERT_EPOCHS=75 EXPERT_MILESTONES="38 56".
+# Empty = gen_configs.py's own. Give such a run its own TAG_SUFFIX: it trains its own expert.
+export EXPERT_EPOCHS="${EXPERT_EPOCHS:-}"
+export EXPERT_MILESTONES="${EXPERT_MILESTONES:-}"
 # 1 = federated victim with the same optimizer-step count as the centralized one
 export SPLIT_BATCH="${SPLIT_BATCH:-0}"
 

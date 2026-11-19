@@ -65,6 +65,10 @@ N_ITERATIONS = 25
 # expert against the current trigger for EXPERT_RETRAIN_EPOCHS epochs. 0 disables entirely.
 EXPERT_RETRAIN_INTERVAL = 1
 EXPERT_RETRAIN_EPOCHS = EPOCHS_EXPERT
+# LR milestones of the clean expert and every retraining round (the user/victim training keeps
+# MILESTONE). None = MILESTONE's, which at fewer than 75 epochs never drops the LR: override it
+# together with the epoch count (--expert-epochs/--expert-milestones).
+EXPERT_MILESTONES = None
 EXPERT_RETRAIN_CHECKPOINT_ITERS = CHECKPOINT_ITERS
 
 # Every batch-step averages the matching/gradient-mismatch terms over this many distinct
@@ -448,6 +452,7 @@ def generate_cell(
     lr = LEARNING_RATE.get(model_flag, 0.1)
     wd = WEIGHT_DECAY.get(model_flag, 2e-4)
     milestones = MILESTONE.get(model_flag, [75, 125])
+    expert_milestones = EXPERT_MILESTONES if EXPERT_MILESTONES is not None else milestones
     rng_seed = draw_rng_seed(model_flag, seed)
 
     cell_dir = EXP_BASE / cell_name(model_flag, dataset, agg_method, seed)
@@ -469,7 +474,7 @@ def generate_cell(
             epochs=EPOCHS_EXPERT,
             lr=lr,
             wd=wd,
-            milestones=milestones,
+            milestones=expert_milestones,
             wandb_block_train_expert=wandb_block(
                 "train_expert",
                 f"train_expert/{model_flag}/{dataset}/seed{seed}",
@@ -525,7 +530,7 @@ def generate_cell(
             expert_max_epoch=min(EPOCHS_EXPERT, EXPERT_RETRAIN_EPOCHS),
             lr=lr,
             wd=wd,
-            milestones=milestones,
+            milestones=expert_milestones,
             wandb_block_module=wandb_block(
                 MODULE_NAME,
                 f"{MODULE_NAME}/{model_flag}/{dataset}/{agg_method}/seed{seed}",
@@ -706,6 +711,11 @@ if __name__ == "__main__":
         "0.0314 for 8/255); unused under --trigger-type warp.",
     )
     parser.add_argument("--lr-delta", type=float, default=None, help="override LR_DELTA (default 1e-2)")
+    parser.add_argument("--expert-epochs", type=int, default=None,
+                        help="epochs of the clean expert AND of every retraining round (default %d)" % EPOCHS_EXPERT)
+    parser.add_argument("--expert-milestones", type=int, nargs="+", default=None,
+                        help="LR drop epochs of the expert/retraining rounds (default: MILESTONE's [75, 125], "
+                        "which never drops below 75 epochs); the user training is unchanged")
     parser.add_argument(
         "--split-batch-across-workers",
         action="store_true",
@@ -813,6 +823,10 @@ if __name__ == "__main__":
         EPSILON = args.epsilon
     if args.lr_delta is not None:
         LR_DELTA = args.lr_delta
+    if args.expert_epochs is not None:
+        EPOCHS_EXPERT = EXPERT_RETRAIN_EPOCHS = args.expert_epochs
+    if args.expert_milestones is not None:
+        EXPERT_MILESTONES = args.expert_milestones
     if args.split_batch_across_workers:
         SPLIT_BATCH_ACROSS_WORKERS = True
     if args.lambda_bd is not None:

@@ -76,6 +76,10 @@ CHECKPOINT_TAG="${CHECKPOINT_TAG:-}"
 PHOTO_CONTRAST="${PHOTO_CONTRAST:-}"
 PHOTO_BRIGHTNESS="${PHOTO_BRIGHTNESS:-}"
 LR_PHOTO="${LR_PHOTO:-}"
+# Clean expert and retraining rounds: epoch count and LR-drop epochs (space-separated, e.g.
+# EXPERT_MILESTONES="38 56"); empty = gen_configs.py's own (200 epochs, drops at 75/125).
+EXPERT_EPOCHS="${EXPERT_EPOCHS:-}"
+EXPERT_MILESTONES="${EXPERT_MILESTONES:-}"
 
 DEPLOY_NUM_POISONED="${DEPLOY_NUM_POISONED:-3}"
 DEPLOY_NUM_HONESTS="${DEPLOY_NUM_HONESTS:-7}"
@@ -94,6 +98,7 @@ FED_DEPLOY_REL="$CELL_REL/${DEPLOY_AGG_METHOD}_${DEPLOY_NUM_POISONED}vs${DEPLOY_
 echo "[PLAN] variant=$VARIANT_TAG trigger_type=$TRIGGER_TYPE warp_s=$WARP_S warp_k=$WARP_K lambda_bd=$LAMBDA_BD lambda_joint=$LAMBDA_JOINT lambda_lpips=$LAMBDA_LPIPS"
 echo "[PLAN] additive half: epsilon=${EPSILON:-<gen_configs default>} lr_delta=${LR_DELTA:-<gen_configs default>}"
 echo "[PLAN] photometric half: contrast=${PHOTO_CONTRAST:-0} brightness=${PHOTO_BRIGHTNESS:-0} lr_photo=${LR_PHOTO:-<default>}"
+echo "[PLAN] expert: epochs=${EXPERT_EPOCHS:-<gen_configs default>} lr milestones=${EXPERT_MILESTONES:-<gen_configs default>}"
 echo "[PLAN] split_batch_across_workers=$SPLIT_BATCH (1 = same optimizer-step count as centralized)"
 echo "[PLAN] model=$MODEL_FLAG dataset=$DATASET seed=$SEED budgets=$BUDGETS_SINGLE"
 echo "[PLAN] centralized (1vs0, mean) vs federated ($DEPLOY_AGG_METHOD, ${DEPLOY_NUM_POISONED}vs${DEPLOY_NUM_HONESTS})"
@@ -127,6 +132,9 @@ GEN_ARGS=(--single-cell --trigger-type "$TRIGGER_TYPE" --exp-base-tag "$VARIANT_
 [ -n "$PHOTO_CONTRAST" ] && GEN_ARGS+=(--photo-contrast "$PHOTO_CONTRAST")
 [ -n "$PHOTO_BRIGHTNESS" ] && GEN_ARGS+=(--photo-brightness "$PHOTO_BRIGHTNESS")
 [ -n "$LR_PHOTO" ] && GEN_ARGS+=(--lr-photo "$LR_PHOTO")
+[ -n "$EXPERT_EPOCHS" ] && GEN_ARGS+=(--expert-epochs "$EXPERT_EPOCHS")
+# shellcheck disable=SC2206
+[ -n "$EXPERT_MILESTONES" ] && GEN_ARGS+=(--expert-milestones $EXPERT_MILESTONES)
 [ "$DRY_RUN" = "1" ] && GEN_ARGS+=(--dry-run)
 run_gen_configs_on_compute_node "${GEN_ARGS[@]}"
 
