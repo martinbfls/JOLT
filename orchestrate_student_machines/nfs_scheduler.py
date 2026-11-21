@@ -26,6 +26,8 @@ Checkpoint affinity -- why this is not just a job pool:
     Jobs reading no checkpoint (select_flips, train_user, plots) go
     anywhere, preferably to machines no pinned job is waiting for.
 
+NFS_MAX_USER_JOBS=N caps the number of train_user jobs running at once (see MAX_USER_JOBS).
+
 Subcommands (all read their settings from the environment, see Settings below):
   status [-v]             counts, running jobs, failures
   start | run | stop      start the daemon detached / in the foreground / stop it
@@ -82,6 +84,10 @@ MIN_GPU_MB = dict(
     (kv.split("=")[0].strip(), int(kv.split("=")[1]))
     for kv in os.environ.get("NFS_MIN_GPU_MB", "generate_labels_trigger_joint=18000").split(",") if "=" in kv
 )
+# At most this many train_user jobs run at once (0 = no limit): the others wait, lowest id first, so a
+# large campaign is spread over waves instead of taking every machine. GEN/flips/plots are not counted.
+MAX_USER_JOBS = int(os.environ.get("NFS_MAX_USER_JOBS", "0"))
+USER_JOB_RE = re.compile(r"/train_user_\d+")
 KINIT_RENEW_EVERY = float(os.environ.get("NFS_KINIT_RENEW_EVERY", "14400"))
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]
 
@@ -724,7 +730,15 @@ class Daemon:
                 return min(cands, key=lambda m: (demand.get(m, 0), order[m])), None
             return None, None
 
+        def is_user_job(jid):
+            return bool(USER_JOB_RE.search(self.jobs[jid].get("cmd", "")))
+
+        running_user = sum(1 for j, st in self.state.items()
+                           if st.get("state") == "running" and j in self.jobs and is_user_job(j))
         for jid in ready:
+            user_job = MAX_USER_JOBS > 0 and is_user_job(jid)
+            if user_job and running_user >= MAX_USER_JOBS:
+                continue        # wave limit reached -- stays pending until a train_user finishes
             r = self.role(jid)
             if r is None:
                 continue        # config not there yet (generated upstream?) -- retry next tick
@@ -739,6 +753,8 @@ class Daemon:
             if target is None:
                 continue
             free[target] -= 1
+            if user_job:
+                running_user += 1
             if role == "producer" and self.pins.get(key) != [target]:
                 self.pins[key] = [target]
                 pins_per_machine[target] = pins_per_machine.get(target, 0) + 1
