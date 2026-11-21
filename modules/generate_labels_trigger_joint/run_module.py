@@ -79,7 +79,8 @@ from modules.generate_labels_trigger_joint.utils import (
 # is how a finished run is extended.
 _RESUME_STRICT_KEYS = (
     "expert_model", "dataset", "source_label", "target_label", "trigger_type", "warp_k",
-    "photo_contrast", "photo_brightness", "num_honests", "num_poisoned", "agg_method", "attack",
+    "photo_contrast", "photo_brightness", "photo_local_contrast", "photo_local_brightness",
+    "photo_local_grid", "color_mix", "kernel_budget", "num_honests", "num_poisoned", "agg_method", "attack",
     "train_pct", "clean_trajectory",
 )
 
@@ -235,6 +236,24 @@ def run(experiment_name, module_name, **kwargs):
     if has_photo and not is_hybrid:
         raise ValueError(
             f"photo_contrast/photo_brightness need trigger_type='hybrid', got {trigger_type!r}"
+        )
+    # Extra expressive transformations (all hybrid-only, off at 0): each a deviation from the identity,
+    # box-bounded by its budget and optimized in the same Adam (lr_ext). Composition order and exact
+    # definitions: apply_trigger_raw / apply_kernel / apply_color_mix / apply_photo_local.
+    photo_local_grid = args.get("photo_local_grid", 4)
+    photo_local_contrast = args.get("photo_local_contrast", 0.0)
+    photo_local_brightness = args.get("photo_local_brightness", 0.0)
+    color_mix_budget = args.get("color_mix", 0.0)
+    kernel_budget = args.get("kernel_budget", 0.0)
+    lr_ext = args.get("lr_ext", 1e-2)
+    has_photo_local = photo_local_contrast > 0 or photo_local_brightness > 0
+    has_color_mix = color_mix_budget > 0
+    has_kernel = kernel_budget > 0
+    has_ext = has_photo_local or has_color_mix or has_kernel
+    if has_ext and not is_hybrid:
+        raise ValueError(
+            "photo_local_*/color_mix/kernel_budget need trigger_type='hybrid', "
+            f"got {trigger_type!r}"
         )
     lambda_bd = args.get("lambda_bd", 1.0)
     lambda_joint = args.get("lambda_joint", 0.0)
@@ -412,13 +431,13 @@ def run(experiment_name, module_name, **kwargs):
         )
     )
 
-    def apply_trigger(x_raw, d, cg, ph=None):
+    def apply_trigger(x_raw, d, cg, ph=None, ex=None):
         """Preprocessed triggered images for the optimized variables: the additive delta `d`, the
         warp control grid `cg` and the photometric (2, C) tensor `ph` (each None when its component
         is off; see apply_trigger_raw)."""
         return raw_to_trigger_preprocess(
             x_raw, d, dataset_flag=dataset_flag, model_flag=expert_model_flag, control_grid=cg, s=warp_s,
-            photo=ph,
+            photo=ph, ext=ex,
         )
 
     def trigger_artifact():
@@ -438,11 +457,26 @@ def run(experiment_name, module_name, **kwargs):
             artifact["photo"] = photo.detach().cpu()
             artifact["photo_contrast"] = photo_contrast
             artifact["photo_brightness"] = photo_brightness
+        if has_ext:
+            artifact["ext"] = {k: v.detach().cpu() for k, v in ext.items()}
+            artifact["ext_budgets"] = {
+                "photo_local_contrast": photo_local_contrast, "photo_local_brightness": photo_local_brightness,
+                "color_mix": color_mix_budget, "kernel_budget": kernel_budget,
+            }
         return artifact
 
     warp_grid = init_warp_field(warp_k, warp_s, device=device) if has_warp else None
     # (2, C): row 0 contrast deviation, row 1 brightness shift; starts at 0 = identity
     photo = torch.zeros(2, mu.shape[0], device=device) if has_photo else None
+    # extra transformations, name -> leaf tensor, all 0 = identity (see apply_trigger_raw)
+    n_ch = mu.shape[0]
+    ext = {}
+    if has_kernel:
+        ext["kernel"] = torch.zeros(n_ch, 3, 3, device=device)
+    if has_color_mix:
+        ext["color_mix"] = torch.zeros(n_ch, n_ch, device=device)
+    if has_photo_local:
+        ext["photo_local"] = torch.zeros(2, n_ch, photo_local_grid, photo_local_grid, device=device)
     delta_add = (
         init_delta(
             mu.shape,
@@ -459,7 +493,7 @@ def run(experiment_name, module_name, **kwargs):
     # to -- the additive perturbation whenever there is one, the control grid under the warp-only
     # trigger (where it is the single optimized variable, as before this file knew about 'hybrid').
     delta = delta_add if has_additive else warp_grid
-    trigger_vars = [v for v in (delta_add, warp_grid, photo) if v is not None]
+    trigger_vars = [v for v in (delta_add, warp_grid, photo) if v is not None] + list(ext.values())
     warp_var_idx = next(i for i, v in enumerate(trigger_vars) if v is warp_grid) if has_warp else None
 
     def accumulate_trigger_grad(loss, weight, extra_targets=(), create_graph=False):
@@ -503,6 +537,8 @@ def run(experiment_name, module_name, **kwargs):
         param_groups = [{"params": [delta_add], "lr": lr_delta}, {"params": [warp_grid], "lr": lr_warp}]
         if has_photo:
             param_groups.append({"params": [photo], "lr": lr_photo})
+        if ext:
+            param_groups.append({"params": list(ext.values()), "lr": lr_ext})
         optimizer_delta = torch.optim.Adam(param_groups)
     else:
         optimizer_delta = torch.optim.Adam([delta], lr=lr_warp if has_warp else lr_delta)
@@ -548,6 +584,7 @@ def run(experiment_name, module_name, **kwargs):
     delta_add_init = None
     warp_grid_init = None
     photo_init = None
+    ext_init = None
     prev_delta_sign = None
 
     expert_pool = None
@@ -629,6 +666,8 @@ def run(experiment_name, module_name, **kwargs):
         if has_photo:
             norms.append(f"|contrast|_max={photo[0].abs().max().item():.4f}, "
                          f"|brightness|_max={photo[1].abs().max().item():.4f}")
+        for name_, v_ in ext.items():
+            norms.append(f"|{name_}|_max={v_.abs().max().item():.4f}")
         print(
             f"[expert_retrain] round {round_idx}: retraining a fresh expert for "
             f"{expert_retrain_epochs} epochs against the CURRENT trigger ({', '.join(norms)})..."
@@ -765,6 +804,8 @@ def run(experiment_name, module_name, **kwargs):
             "labels_syn": _cpu(labels_syn),
             "optimizer_labels": optimizer_labels.state_dict(),
             "trigger": {"delta_add": _cpu(delta_add), "warp_grid": _cpu(warp_grid), "photo": _cpu(photo)},
+            "ext": {k: _cpu(v) for k, v in ext.items()},
+            "ext_init": None if ext_init is None else {k: _cpu(v) for k, v in ext_init.items()},
             "optimizer_delta": optimizer_delta.state_dict(),
             "trigger_init": {
                 "delta_add": _cpu(delta_add_init), "warp_grid": _cpu(warp_grid_init), "photo": _cpu(photo_init),
@@ -813,6 +854,10 @@ def run(experiment_name, module_name, **kwargs):
         delta_add_init = _dev(st["trigger_init"]["delta_add"])
         warp_grid_init = _dev(st["trigger_init"]["warp_grid"])
         photo_init = _dev(st["trigger_init"]["photo"])
+        for k_, v_ in ext.items():
+            with torch.no_grad():
+                v_.copy_(st["ext"][k_].to(v_.device))
+        ext_init = None if st.get("ext_init") is None else {k_: _dev(v_) for k_, v_ in st["ext_init"].items()}
         delta_init = delta_add_init if has_additive else warp_grid_init
         prev_delta_sign = _dev(st["prev_delta_sign"])
         align_active_window = st["align_active_window"]
@@ -943,7 +988,7 @@ def run(experiment_name, module_name, **kwargs):
                             if is_poisoned.any():
                                 idx_poisoned = idx[is_poisoned].tolist()
                                 x_raw_adv = _raw_poison_batch(idx_poisoned)
-                                x_trig = apply_trigger(x_raw_adv, delta_add, warp_grid, photo)
+                                x_trig = apply_trigger(x_raw_adv, delta_add, warp_grid, photo, ext)
                                 x_t_adv = x_t.clone()
 
                                 x_t_adv[is_poisoned_dev] = x_trig
@@ -1009,7 +1054,7 @@ def run(experiment_name, module_name, **kwargs):
                                 if lpips_model is not None:
                                     L_lpips_cid = lpips_penalty(
                                         x_raw_adv, lpips_model, delta=delta_add,
-                                        control_grid=warp_grid, warp_s=warp_s, photo=photo,
+                                        control_grid=warp_grid, warp_s=warp_s, photo=photo, ext=ext,
                                     )
                                     accumulate_trigger_grad(
                                         L_lpips_cid, lambda_lpips / n_checkpoints_per_step,
@@ -1202,6 +1247,13 @@ def run(experiment_name, module_name, **kwargs):
                     if has_photo:
                         photo[0].clamp_(-photo_contrast, photo_contrast)
                         photo[1].clamp_(-photo_brightness, photo_brightness)
+                    if "kernel" in ext:
+                        ext["kernel"].clamp_(-kernel_budget, kernel_budget)
+                    if "color_mix" in ext:
+                        ext["color_mix"].clamp_(-color_mix_budget, color_mix_budget)
+                    if "photo_local" in ext:
+                        ext["photo_local"][0].clamp_(-photo_local_contrast, photo_local_contrast)
+                        ext["photo_local"][1].clamp_(-photo_local_brightness, photo_local_brightness)
 
                 for m in expert_models:
                     m.eval()
@@ -1237,6 +1289,7 @@ def run(experiment_name, module_name, **kwargs):
                         delta_add_init = delta_add.detach().clone() if has_additive else None
                         warp_grid_init = warp_grid.detach().clone() if has_warp else None
                         photo_init = photo.detach().clone() if has_photo else None
+                        ext_init = {k_: v_.detach().clone() for k_, v_ in ext.items()} if ext else None
                         delta_init = delta_add_init if has_additive else warp_grid_init
                     cos_to_init = cosine_to(delta, delta_init).item()
                     delta_drift_l2 = (delta - delta_init).norm().item()
@@ -1246,8 +1299,8 @@ def run(experiment_name, module_name, **kwargs):
                             f"delta_drift_l2={delta_drift_l2} -- expected exactly 1.0/0.0."
                         )
 
-                    x_trig_eval = apply_trigger(asr_eval_raw, delta_add, warp_grid, photo)
-                    x_trig_eval_frozen = apply_trigger(asr_eval_raw, delta_add_init, warp_grid_init, photo_init)
+                    x_trig_eval = apply_trigger(asr_eval_raw, delta_add, warp_grid, photo, ext)
+                    x_trig_eval_frozen = apply_trigger(asr_eval_raw, delta_add_init, warp_grid_init, photo_init, ext_init)
                     asr_mean_list = [
                         (m(x_trig_eval).argmax(dim=1) == target_label).float().mean().item() for m in expert_models
                     ]
@@ -1310,6 +1363,8 @@ def run(experiment_name, module_name, **kwargs):
                 if has_photo:
                     step_metrics["photo_contrast_abs"] = photo[0].abs().max().item()
                     step_metrics["photo_brightness_abs"] = photo[1].abs().max().item()
+                for name_, v_ in ext.items():
+                    step_metrics[f"{name_}_abs"] = v_.abs().max().item()
                 if history is not None:
                     history.append({"it": it, **step_metrics})
                 tracker.log(global_step, **step_metrics)
@@ -1340,6 +1395,8 @@ def run(experiment_name, module_name, **kwargs):
                 if has_photo:
                     postfix["photo_c"] = f"{photo[0].abs().max().item():.3g}"
                     postfix["photo_b"] = f"{photo[1].abs().max().item():.3g}"
+                for name_, v_ in ext.items():
+                    postfix[name_] = f"{v_.abs().max().item():.3g}"
                 pbar.set_postfix(**postfix)
 
             _save_resume_state(it + 1)

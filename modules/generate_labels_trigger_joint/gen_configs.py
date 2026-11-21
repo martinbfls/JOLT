@@ -115,6 +115,17 @@ LR_WARP = 0.1
 PHOTO_CONTRAST = 0.0
 PHOTO_BRIGHTNESS = 0.0
 LR_PHOTO = 0.01
+# Extra expressive transformations of the hybrid trigger (each a box-bounded deviation from the identity,
+# see apply_trigger_raw; 0 = off, configs then unchanged): spatially varying contrast/brightness on a
+# PHOTO_LOCAL_GRID x PHOTO_LOCAL_GRID grid, a COLOR_MIX channel-mixing matrix and a 3x3
+# per-channel KERNEL_BUDGET blur/sharpen kernel; all share LR_EXT. Composition: warp -> kernel ->
+# color_mix -> photo -> photo_local -> + delta.
+PHOTO_LOCAL_GRID = 4
+PHOTO_LOCAL_CONTRAST = 0.0
+PHOTO_LOCAL_BRIGHTNESS = 0.0
+COLOR_MIX = 0.0
+KERNEL_BUDGET = 0.0
+LR_EXT = 0.01
 
 LAMBDA_GRADMATCH = 1.0
 GRADMATCH_EPS = 1e-8
@@ -293,6 +304,27 @@ def _with_photo(content, photo_contrast, photo_brightness, lr_photo):
     return content[:end] + block + content[end:]
 
 
+def _with_ext(content):
+    """Adds the extra-transformation keys (module globals PHOTO_LOCAL_*/COLOR_MIX/KERNEL_BUDGET/LR_EXT)
+    after `lr_warp`. All budgets at 0 (off) leave the config untouched."""
+    if not (PHOTO_LOCAL_CONTRAST or PHOTO_LOCAL_BRIGHTNESS or COLOR_MIX or KERNEL_BUDGET):
+        return content
+    marker = "lr_warp = "
+    start = content.index(marker)
+    end = content.index("\n", start) + 1
+    block = ""
+    if PHOTO_LOCAL_CONTRAST or PHOTO_LOCAL_BRIGHTNESS:
+        block += (f"photo_local_grid = {PHOTO_LOCAL_GRID}\n"
+                  f"photo_local_contrast = {PHOTO_LOCAL_CONTRAST}\n"
+                  f"photo_local_brightness = {PHOTO_LOCAL_BRIGHTNESS}\n")
+    if COLOR_MIX:
+        block += f"color_mix = {COLOR_MIX}\n"
+    if KERNEL_BUDGET:
+        block += f"kernel_budget = {KERNEL_BUDGET}\n"
+    block += f"lr_ext = {LR_EXT}\n"
+    return content[:end] + block + content[end:]
+
+
 def _poisoner_for(trigger_type):
     """train_user's poisoner flag for this trigger_type (see POISONER_BY_TRIGGER_TYPE)."""
     if trigger_type not in POISONER_BY_TRIGGER_TYPE:
@@ -425,6 +457,8 @@ def generate_cell(
     lr_photo = LR_PHOTO if lr_photo is None else lr_photo
     if (photo_contrast or photo_brightness) and trigger_type != "hybrid":
         raise ValueError("--photo-contrast/--photo-brightness need --trigger-type hybrid")
+    if (PHOTO_LOCAL_CONTRAST or PHOTO_LOCAL_BRIGHTNESS or COLOR_MIX or KERNEL_BUDGET) and trigger_type != "hybrid":
+        raise ValueError("--photo-local-*/--color-mix/--kernel-budget need --trigger-type hybrid")
     poisoner = _poisoner_for(trigger_type)
     ckpt_subdir = f"{model_flag}_1xs" if checkpoint_tag is None else f"{model_flag}_1xs_{checkpoint_tag}"
 
@@ -485,7 +519,7 @@ def generate_cell(
                 group=model_flag,
             ),
         ),
-        module_dir / "config.toml": _with_photo(JOINT_TRIGGER_TEMPLATE.format(
+        module_dir / "config.toml": _with_ext(_with_photo(JOINT_TRIGGER_TEMPLATE.format(
             cluster_root=CLUSTER_ROOT,
             ckpt_subdir=ckpt_subdir,
             model_flag=model_flag,
@@ -540,7 +574,7 @@ def generate_cell(
                 entity=WANDB_ENTITY,
                 group=model_flag,
             ),
-        ), photo_contrast, photo_brightness, lr_photo),
+        ), photo_contrast, photo_brightness, lr_photo)),
         flips_dir / "config.toml": SELECT_FLIPS_TEMPLATE.format(
             budgets=budgets,
             module_dir=module_dir,
@@ -702,6 +736,16 @@ if __name__ == "__main__":
                         help="override PHOTO_BRIGHTNESS: budget of the per-channel brightness half of "
                              "the hybrid trigger (shift b, |b| <= this, in [0, 1] intensity). 0 = off.")
     parser.add_argument("--lr-photo", type=float, default=None, help="override LR_PHOTO")
+    parser.add_argument("--photo-local-grid", type=int, default=None, help="side of the local contrast/brightness grid (default 4)")
+    parser.add_argument("--photo-local-contrast", type=float, default=None,
+                        help="budget of the spatially varying contrast (hybrid only; 0 = off)")
+    parser.add_argument("--photo-local-brightness", type=float, default=None,
+                        help="budget of the spatially varying brightness (hybrid only; 0 = off)")
+    parser.add_argument("--color-mix", type=float, default=None,
+                        help="budget of each coefficient of the channel-mixing matrix's deviation from the identity (hybrid only; 0 = off)")
+    parser.add_argument("--kernel-budget", type=float, default=None,
+                        help="budget of each coefficient of the 3x3 kernel's deviation from the identity kernel (hybrid only; 0 = off)")
+    parser.add_argument("--lr-ext", type=float, default=None, help="learning rate of the extra transformations (default 0.01)")
     parser.add_argument(
         "--epsilon",
         type=float,
@@ -819,6 +863,18 @@ if __name__ == "__main__":
         PHOTO_BRIGHTNESS = args.photo_brightness
     if args.lr_photo is not None:
         LR_PHOTO = args.lr_photo
+    if args.photo_local_grid is not None:
+        PHOTO_LOCAL_GRID = args.photo_local_grid
+    if args.photo_local_contrast is not None:
+        PHOTO_LOCAL_CONTRAST = args.photo_local_contrast
+    if args.photo_local_brightness is not None:
+        PHOTO_LOCAL_BRIGHTNESS = args.photo_local_brightness
+    if args.color_mix is not None:
+        COLOR_MIX = args.color_mix
+    if args.kernel_budget is not None:
+        KERNEL_BUDGET = args.kernel_budget
+    if args.lr_ext is not None:
+        LR_EXT = args.lr_ext
     if args.epsilon is not None:
         EPSILON = args.epsilon
     if args.lr_delta is not None:

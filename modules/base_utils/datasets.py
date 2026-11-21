@@ -447,6 +447,9 @@ class HybridPoisoner(Poisoner):
         # optional photometric half, (2, C): per-channel contrast deviation and brightness shift
         photo = trigger.get("photo")
         self.photo = None if photo is None else photo.detach()
+        # optional extra transformations (kernel / color_mix / photo_local), see apply_trigger_raw
+        ext = trigger.get("ext")
+        self.ext = None if not ext else {k: v.detach() for k, v in ext.items()}
 
     def poison(self, x: Image.Image) -> Image.Image:
         from modules.optimizing_trigger.utils import apply_trigger_raw  # local: utils imports this module
@@ -462,7 +465,7 @@ class HybridPoisoner(Poisoner):
                 align_corners=False
             ).squeeze(0)
 
-        poisoned_tensor = apply_trigger_raw(x_tensor, delta, self.control_grid, self.s, self.photo)
+        poisoned_tensor = apply_trigger_raw(x_tensor, delta, self.control_grid, self.s, self.photo, self.ext)
         return transforms.ToPILImage()(poisoned_tensor)
 
 

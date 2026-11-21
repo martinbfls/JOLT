@@ -76,6 +76,14 @@ CHECKPOINT_TAG="${CHECKPOINT_TAG:-}"
 PHOTO_CONTRAST="${PHOTO_CONTRAST:-}"
 PHOTO_BRIGHTNESS="${PHOTO_BRIGHTNESS:-}"
 LR_PHOTO="${LR_PHOTO:-}"
+# Extra expressive transformations of the hybrid trigger (budgets; empty/0 = off): local contrast/brightness
+# grid, channel-mixing matrix, 3x3 kernel (see gen_configs.py --photo-local-* / --color-mix / --kernel-budget).
+PHOTO_LOCAL_CONTRAST="${PHOTO_LOCAL_CONTRAST:-}"
+PHOTO_LOCAL_BRIGHTNESS="${PHOTO_LOCAL_BRIGHTNESS:-}"
+PHOTO_LOCAL_GRID="${PHOTO_LOCAL_GRID:-}"
+COLOR_MIX="${COLOR_MIX:-}"
+KERNEL_BUDGET="${KERNEL_BUDGET:-}"
+LR_EXT="${LR_EXT:-}"
 # Clean expert and retraining rounds: epoch count and LR-drop epochs (space-separated, e.g.
 # EXPERT_MILESTONES="38 56"); empty = gen_configs.py's own (200 epochs, drops at 75/125).
 EXPERT_EPOCHS="${EXPERT_EPOCHS:-}"
@@ -98,6 +106,7 @@ FED_DEPLOY_REL="$CELL_REL/${DEPLOY_AGG_METHOD}_${DEPLOY_NUM_POISONED}vs${DEPLOY_
 echo "[PLAN] variant=$VARIANT_TAG trigger_type=$TRIGGER_TYPE warp_s=$WARP_S warp_k=$WARP_K lambda_bd=$LAMBDA_BD lambda_joint=$LAMBDA_JOINT lambda_lpips=$LAMBDA_LPIPS"
 echo "[PLAN] additive half: epsilon=${EPSILON:-<gen_configs default>} lr_delta=${LR_DELTA:-<gen_configs default>}"
 echo "[PLAN] photometric half: contrast=${PHOTO_CONTRAST:-0} brightness=${PHOTO_BRIGHTNESS:-0} lr_photo=${LR_PHOTO:-<default>}"
+echo "[PLAN] extra transformations: photo_local=${PHOTO_LOCAL_CONTRAST:-0}/${PHOTO_LOCAL_BRIGHTNESS:-0} color_mix=${COLOR_MIX:-0} kernel=${KERNEL_BUDGET:-0}"
 echo "[PLAN] expert: epochs=${EXPERT_EPOCHS:-<gen_configs default>} lr milestones=${EXPERT_MILESTONES:-<gen_configs default>}"
 echo "[PLAN] split_batch_across_workers=$SPLIT_BATCH (1 = same optimizer-step count as centralized)"
 echo "[PLAN] model=$MODEL_FLAG dataset=$DATASET seed=$SEED budgets=$BUDGETS_SINGLE"
@@ -132,6 +141,12 @@ GEN_ARGS=(--single-cell --trigger-type "$TRIGGER_TYPE" --exp-base-tag "$VARIANT_
 [ -n "$PHOTO_CONTRAST" ] && GEN_ARGS+=(--photo-contrast "$PHOTO_CONTRAST")
 [ -n "$PHOTO_BRIGHTNESS" ] && GEN_ARGS+=(--photo-brightness "$PHOTO_BRIGHTNESS")
 [ -n "$LR_PHOTO" ] && GEN_ARGS+=(--lr-photo "$LR_PHOTO")
+[ -n "$PHOTO_LOCAL_CONTRAST" ] && GEN_ARGS+=(--photo-local-contrast "$PHOTO_LOCAL_CONTRAST")
+[ -n "$PHOTO_LOCAL_BRIGHTNESS" ] && GEN_ARGS+=(--photo-local-brightness "$PHOTO_LOCAL_BRIGHTNESS")
+[ -n "$PHOTO_LOCAL_GRID" ] && GEN_ARGS+=(--photo-local-grid "$PHOTO_LOCAL_GRID")
+[ -n "$COLOR_MIX" ] && GEN_ARGS+=(--color-mix "$COLOR_MIX")
+[ -n "$KERNEL_BUDGET" ] && GEN_ARGS+=(--kernel-budget "$KERNEL_BUDGET")
+[ -n "$LR_EXT" ] && GEN_ARGS+=(--lr-ext "$LR_EXT")
 [ -n "$EXPERT_EPOCHS" ] && GEN_ARGS+=(--expert-epochs "$EXPERT_EPOCHS")
 # shellcheck disable=SC2206
 [ -n "$EXPERT_MILESTONES" ] && GEN_ARGS+=(--expert-milestones $EXPERT_MILESTONES)

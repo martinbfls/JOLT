@@ -69,6 +69,10 @@ export LR_DELTA="${LR_DELTA:-}"   # empty leaves gen_configs.py's own default (1
 export PHOTO_CONTRAST="${PHOTO_CONTRAST:-}"
 export PHOTO_BRIGHTNESS="${PHOTO_BRIGHTNESS:-}"
 export LR_PHOTO="${LR_PHOTO:-}"
+# Extra expressive transformations (exported to each cell; empty/0 = off): PHOTO_LOCAL_CONTRAST,
+# PHOTO_LOCAL_BRIGHTNESS, PHOTO_LOCAL_GRID, COLOR_MIX, KERNEL_BUDGET, LR_EXT -- give such a run its own TAG_SUFFIX.
+export PHOTO_LOCAL_CONTRAST="${PHOTO_LOCAL_CONTRAST:-}" PHOTO_LOCAL_BRIGHTNESS="${PHOTO_LOCAL_BRIGHTNESS:-}"
+export PHOTO_LOCAL_GRID="${PHOTO_LOCAL_GRID:-}" COLOR_MIX="${COLOR_MIX:-}" KERNEL_BUDGET="${KERNEL_BUDGET:-}" LR_EXT="${LR_EXT:-}"
 TAG_SUFFIX="${TAG_SUFFIX:-}"
 # Expert epoch count / LR-drop epochs (exported to each cell), e.g. EXPERT_EPOCHS=75 EXPERT_MILESTONES="38 56".
 # Empty = gen_configs.py's own. Give such a run its own TAG_SUFFIX: it trains its own expert.

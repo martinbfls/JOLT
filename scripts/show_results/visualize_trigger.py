@@ -107,6 +107,17 @@ def main():
         c, b = photo[0].tolist(), photo[1].tolist()
         title += ("\ncontrast gain " + ", ".join(f"{1 + v:.3f}" for v in c)
                   + " | brightness shift " + ", ".join(f"{v:+.3f}" for v in b) + " (R, G, B)")
+    ext = saved.get("ext") if saved is not None else None  # kernel / color_mix / photo_local deviations
+    if ext:
+        parts = []
+        if "kernel" in ext:
+            parts.append(f"kernel |dev|max {float(ext['kernel'].abs().max()):.3f}")
+        if "color_mix" in ext:
+            parts.append(f"color mix |dev|max {float(ext['color_mix'].abs().max()):.3f}")
+        if "photo_local" in ext:
+            pl = ext["photo_local"]
+            parts.append(f"local contrast |a|max {float(pl[0].abs().max()):.3f}, brightness |b|max {float(pl[1].abs().max()):.3f}")
+        title += "\n" + " | ".join(parts)
     fig.suptitle(title)
     fig.tight_layout()
     out.parent.mkdir(parents=True, exist_ok=True)
