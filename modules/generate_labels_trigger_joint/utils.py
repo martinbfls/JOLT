@@ -8,8 +8,20 @@ from modules.base_utils.datasets import MTTDataset
 from modules.federated_generate_labels.utils import DEFAULT_EXPERT_CONFIG
 
 
+def load_expert_pool(pool_paths):
+    """Loads the (params, optimizer-state) checkpoint pairs at `pool_paths` into RAM (float32, CPU)."""
+    return [
+        (
+            {k: v.float().cpu() for k, v in torch.load(p_path, map_location="cpu").items()},
+            torch.load(o_path, map_location="cpu"),
+        )
+        for p_path, o_path in pool_paths
+    ]
+
+
 def build_expert_pool(expert_starts, expert_opt_starts, pool_size):
-    """Preloads `pool_size` distinct (params, optimizer-state) checkpoint pairs into RAM, drawn from uniformly per step."""
+    """Preloads `pool_size` distinct (params, optimizer-state) checkpoint pairs into RAM, drawn from uniformly per step.
+    Returns (pool, pool_size, pool_paths), pool_paths being the [(params_path, opt_path), ...] loaded."""
     all_pairs = list(dict.fromkeys(zip(expert_starts, expert_opt_starts)))
     if pool_size > len(all_pairs):
         print(
@@ -18,14 +30,7 @@ def build_expert_pool(expert_starts, expert_opt_starts, pool_size):
         )
         pool_size = len(all_pairs)
     pool_paths = random.sample(all_pairs, pool_size)
-    pool = [
-        (
-            {k: v.float().cpu() for k, v in torch.load(p_path, map_location="cpu").items()},
-            torch.load(o_path, map_location="cpu"),
-        )
-        for p_path, o_path in pool_paths
-    ]
-    return pool, pool_size
+    return load_expert_pool(pool_paths), pool_size, pool_paths
 
 
 class TriggerMTTDataset(MTTDataset):
@@ -161,14 +166,14 @@ def poison_consistency(poison_grad_chunks, eps=1e-8):
     return 1.0 - F.cosine_similarity(G, g_bar.unsqueeze(0).expand_as(G), dim=1, eps=eps).mean()
 
 
-def lpips_penalty(x_raw_clean, lpips_model, delta=None, control_grid=None, warp_s=1.0):
+def lpips_penalty(x_raw_clean, lpips_model, delta=None, control_grid=None, warp_s=1.0, photo=None, ext=None):
     """Perceptual (LPIPS) distance between the clean raw image(s) and their triggered counterpart,
     differentiable w.r.t. whichever trigger variables are passed: the pixel delta under
     trigger_type='additive', the warp control grid under 'warp', both composed under 'hybrid'
     (see apply_trigger_raw, modules/optimizing_trigger/utils.py, for the composition)."""
     from modules.optimizing_trigger.utils import apply_trigger_raw
 
-    x_trig_raw = apply_trigger_raw(x_raw_clean, delta, control_grid, warp_s)
+    x_trig_raw = apply_trigger_raw(x_raw_clean, delta, control_grid, warp_s, photo, ext)
     x_clean_scaled = x_raw_clean * 2 - 1
     x_trig_scaled = x_trig_raw * 2 - 1
     return lpips_model(x_trig_scaled, x_clean_scaled).mean()

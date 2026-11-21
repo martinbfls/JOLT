@@ -508,3 +508,20 @@ submit_job_pool_slurm() {
     fi
     return 0
 }
+# ---------------------------------------------------------------------------
+# EXECUTOR=nfs runs the same campaign scripts on the NFS-shared student machines instead of
+# Slurm: orchestrate_student_machines/nfs_lib.sh redefines the submit functions above (see its
+# header). Unset or "slurm" (the default): nothing below changes anything.
+# ---------------------------------------------------------------------------
+EXECUTOR="${EXECUTOR:-slurm}"
+case "$EXECUTOR" in
+    slurm) ;;
+    nfs)
+        # shellcheck source=../orchestrate_student_machines/nfs_lib.sh
+        source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/orchestrate_student_machines/nfs_lib.sh"
+        ;;
+    *)
+        echo "[slurm_lib] unknown EXECUTOR='$EXECUTOR' (expected slurm or nfs)" >&2
+        exit 1
+        ;;
+esac

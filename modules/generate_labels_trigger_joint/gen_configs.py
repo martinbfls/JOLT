@@ -49,12 +49,15 @@ SOURCE_LABEL = 9
 TARGET_LABEL = 4
 
 # This module's own default; a cross-module comparison must set both generators the same way.
-CHECKPOINT_SAMPLING = "biased"
+# "uniform": every outer step draws its expert checkpoints uniformly over the WHOLE trajectory
+# (epochs 1..EPOCHS_EXPERT, see expert_config's max below), not biased toward its start.
+CHECKPOINT_SAMPLING = "uniform"
 INDIRECT_MODULE_CHECKPOINT_SAMPLING = "uniform"
 
 ALPHA_CKPT = 0.01
 TRAIN_PCT = 1.0
-EPOCHS_EXPERT = 20
+# The full schedule (lr milestones [75, 125]), for the clean expert and every retraining round alike.
+EPOCHS_EXPERT = 200
 CHECKPOINT_ITERS = 50
 N_ITERATIONS = 25
 
@@ -62,6 +65,10 @@ N_ITERATIONS = 25
 # expert against the current trigger for EXPERT_RETRAIN_EPOCHS epochs. 0 disables entirely.
 EXPERT_RETRAIN_INTERVAL = 1
 EXPERT_RETRAIN_EPOCHS = EPOCHS_EXPERT
+# LR milestones of the clean expert and every retraining round (the user/victim training keeps
+# MILESTONE). None = MILESTONE's, which at fewer than 75 epochs never drops the LR: override it
+# together with the epoch count (--expert-epochs/--expert-milestones).
+EXPERT_MILESTONES = None
 EXPERT_RETRAIN_CHECKPOINT_ITERS = CHECKPOINT_ITERS
 
 # Every batch-step averages the matching/gradient-mismatch terms over this many distinct
@@ -102,6 +109,23 @@ TRIGGER_TYPE = "additive"
 WARP_K = 4
 WARP_S = 1.0
 LR_WARP = 0.1
+# Photometric half of the hybrid trigger (per-channel contrast gain 1+a, |a| <= PHOTO_CONTRAST, and
+# brightness shift b, |b| <= PHOTO_BRIGHTNESS, between the warp and the additive delta). Both 0 =
+# off: the configs are then written without these keys, byte-identical to before.
+PHOTO_CONTRAST = 0.0
+PHOTO_BRIGHTNESS = 0.0
+LR_PHOTO = 0.01
+# Extra expressive transformations of the hybrid trigger (each a box-bounded deviation from the identity,
+# see apply_trigger_raw; 0 = off, configs then unchanged): spatially varying contrast/brightness on a
+# PHOTO_LOCAL_GRID x PHOTO_LOCAL_GRID grid, a COLOR_MIX channel-mixing matrix and a 3x3
+# per-channel KERNEL_BUDGET blur/sharpen kernel; all share LR_EXT. Composition: warp -> kernel ->
+# color_mix -> photo -> photo_local -> + delta.
+PHOTO_LOCAL_GRID = 4
+PHOTO_LOCAL_CONTRAST = 0.0
+PHOTO_LOCAL_BRIGHTNESS = 0.0
+COLOR_MIX = 0.0
+KERNEL_BUDGET = 0.0
+LR_EXT = 0.01
 
 LAMBDA_GRADMATCH = 1.0
 GRADMATCH_EPS = 1e-8
@@ -211,11 +235,12 @@ expert_retrain_scheduler_kwargs = {{milestones = {milestones}, gamma = 0.1}}
 seed = {rng_seed}
 
 n_checkpoints_per_step = {n_checkpoints_per_step}
+resume_state_path = "{cell_dir}/resume/state.pt"
 {wandb_block_module}
 [generate_labels_trigger_joint.expert_config]
 experts = 1
 min = 0
-max = 20
+max = {expert_max_epoch}
 trajectories = [50, 100, 150, 200]
 
 [generate_labels_trigger_joint.attack_config]
@@ -263,6 +288,41 @@ def trigger_output_path(module_dir, model_flag, dataset, num_poisoned, num_hones
 
 def cell_name(model_flag, dataset, agg_method, seed):
     return f"{model_flag}/{dataset}/{NUM_POISONED}vs{NUM_HONESTS}/{agg_method}/seed{seed}"
+
+
+def _with_photo(content, photo_contrast, photo_brightness, lr_photo):
+    """Adds the photometric keys after `lr_warp` in a generated generate_labels_trigger_joint config.
+    Both budgets at 0 (off) leave the config untouched, so non-photometric configs are unchanged."""
+    if not (photo_contrast or photo_brightness):
+        return content
+    marker = "lr_warp = "
+    start = content.index(marker)
+    end = content.index("\n", start) + 1
+    block = (f"photo_contrast = {photo_contrast}\n"
+             f"photo_brightness = {photo_brightness}\n"
+             f"lr_photo = {lr_photo}\n")
+    return content[:end] + block + content[end:]
+
+
+def _with_ext(content):
+    """Adds the extra-transformation keys (module globals PHOTO_LOCAL_*/COLOR_MIX/KERNEL_BUDGET/LR_EXT)
+    after `lr_warp`. All budgets at 0 (off) leave the config untouched."""
+    if not (PHOTO_LOCAL_CONTRAST or PHOTO_LOCAL_BRIGHTNESS or COLOR_MIX or KERNEL_BUDGET):
+        return content
+    marker = "lr_warp = "
+    start = content.index(marker)
+    end = content.index("\n", start) + 1
+    block = ""
+    if PHOTO_LOCAL_CONTRAST or PHOTO_LOCAL_BRIGHTNESS:
+        block += (f"photo_local_grid = {PHOTO_LOCAL_GRID}\n"
+                  f"photo_local_contrast = {PHOTO_LOCAL_CONTRAST}\n"
+                  f"photo_local_brightness = {PHOTO_LOCAL_BRIGHTNESS}\n")
+    if COLOR_MIX:
+        block += f"color_mix = {COLOR_MIX}\n"
+    if KERNEL_BUDGET:
+        block += f"kernel_budget = {KERNEL_BUDGET}\n"
+    block += f"lr_ext = {LR_EXT}\n"
+    return content[:end] + block + content[end:]
 
 
 def _poisoner_for(trigger_type):
@@ -374,6 +434,9 @@ def generate_cell(
     warp_k=None,
     warp_s=None,
     lr_warp=None,
+    photo_contrast=None,
+    photo_brightness=None,
+    lr_photo=None,
     checkpoint_tag=None,
     lambda_bd=None,
     lambda_joint=None,
@@ -389,6 +452,13 @@ def generate_cell(
     warp_k = WARP_K if warp_k is None else warp_k
     warp_s = WARP_S if warp_s is None else warp_s
     lr_warp = LR_WARP if lr_warp is None else lr_warp
+    photo_contrast = PHOTO_CONTRAST if photo_contrast is None else photo_contrast
+    photo_brightness = PHOTO_BRIGHTNESS if photo_brightness is None else photo_brightness
+    lr_photo = LR_PHOTO if lr_photo is None else lr_photo
+    if (photo_contrast or photo_brightness) and trigger_type != "hybrid":
+        raise ValueError("--photo-contrast/--photo-brightness need --trigger-type hybrid")
+    if (PHOTO_LOCAL_CONTRAST or PHOTO_LOCAL_BRIGHTNESS or COLOR_MIX or KERNEL_BUDGET) and trigger_type != "hybrid":
+        raise ValueError("--photo-local-*/--color-mix/--kernel-budget need --trigger-type hybrid")
     poisoner = _poisoner_for(trigger_type)
     ckpt_subdir = f"{model_flag}_1xs" if checkpoint_tag is None else f"{model_flag}_1xs_{checkpoint_tag}"
 
@@ -416,6 +486,7 @@ def generate_cell(
     lr = LEARNING_RATE.get(model_flag, 0.1)
     wd = WEIGHT_DECAY.get(model_flag, 2e-4)
     milestones = MILESTONE.get(model_flag, [75, 125])
+    expert_milestones = EXPERT_MILESTONES if EXPERT_MILESTONES is not None else milestones
     rng_seed = draw_rng_seed(model_flag, seed)
 
     cell_dir = EXP_BASE / cell_name(model_flag, dataset, agg_method, seed)
@@ -437,7 +508,7 @@ def generate_cell(
             epochs=EPOCHS_EXPERT,
             lr=lr,
             wd=wd,
-            milestones=milestones,
+            milestones=expert_milestones,
             wandb_block_train_expert=wandb_block(
                 "train_expert",
                 f"train_expert/{model_flag}/{dataset}/seed{seed}",
@@ -448,7 +519,7 @@ def generate_cell(
                 group=model_flag,
             ),
         ),
-        module_dir / "config.toml": JOINT_TRIGGER_TEMPLATE.format(
+        module_dir / "config.toml": _with_ext(_with_photo(JOINT_TRIGGER_TEMPLATE.format(
             cluster_root=CLUSTER_ROOT,
             ckpt_subdir=ckpt_subdir,
             model_flag=model_flag,
@@ -490,9 +561,10 @@ def generate_cell(
             expert_retrain_epochs=EXPERT_RETRAIN_EPOCHS,
             expert_retrain_checkpoint_iters=EXPERT_RETRAIN_CHECKPOINT_ITERS,
             n_checkpoints_per_step=N_CHECKPOINTS_PER_STEP,
+            expert_max_epoch=min(EPOCHS_EXPERT, EXPERT_RETRAIN_EPOCHS),
             lr=lr,
             wd=wd,
-            milestones=milestones,
+            milestones=expert_milestones,
             wandb_block_module=wandb_block(
                 MODULE_NAME,
                 f"{MODULE_NAME}/{model_flag}/{dataset}/{agg_method}/seed{seed}",
@@ -502,7 +574,7 @@ def generate_cell(
                 entity=WANDB_ENTITY,
                 group=model_flag,
             ),
-        ),
+        ), photo_contrast, photo_brightness, lr_photo)),
         flips_dir / "config.toml": SELECT_FLIPS_TEMPLATE.format(
             budgets=budgets,
             module_dir=module_dir,
@@ -657,6 +729,23 @@ if __name__ == "__main__":
     parser.add_argument("--warp-k", type=int, default=None, help="override WARP_K (warp control-grid side)")
     parser.add_argument("--warp-s", type=float, default=None, help="override WARP_S (max warp displacement, px)")
     parser.add_argument("--lr-warp", type=float, default=None, help="override LR_WARP")
+    parser.add_argument("--photo-contrast", type=float, default=None,
+                        help="override PHOTO_CONTRAST: budget of the per-channel contrast half of the "
+                             "hybrid trigger (gain 1+a, |a| <= this). 0 = off.")
+    parser.add_argument("--photo-brightness", type=float, default=None,
+                        help="override PHOTO_BRIGHTNESS: budget of the per-channel brightness half of "
+                             "the hybrid trigger (shift b, |b| <= this, in [0, 1] intensity). 0 = off.")
+    parser.add_argument("--lr-photo", type=float, default=None, help="override LR_PHOTO")
+    parser.add_argument("--photo-local-grid", type=int, default=None, help="side of the local contrast/brightness grid (default 4)")
+    parser.add_argument("--photo-local-contrast", type=float, default=None,
+                        help="budget of the spatially varying contrast (hybrid only; 0 = off)")
+    parser.add_argument("--photo-local-brightness", type=float, default=None,
+                        help="budget of the spatially varying brightness (hybrid only; 0 = off)")
+    parser.add_argument("--color-mix", type=float, default=None,
+                        help="budget of each coefficient of the channel-mixing matrix's deviation from the identity (hybrid only; 0 = off)")
+    parser.add_argument("--kernel-budget", type=float, default=None,
+                        help="budget of each coefficient of the 3x3 kernel's deviation from the identity kernel (hybrid only; 0 = off)")
+    parser.add_argument("--lr-ext", type=float, default=None, help="learning rate of the extra transformations (default 0.01)")
     parser.add_argument(
         "--epsilon",
         type=float,
@@ -666,6 +755,11 @@ if __name__ == "__main__":
         "0.0314 for 8/255); unused under --trigger-type warp.",
     )
     parser.add_argument("--lr-delta", type=float, default=None, help="override LR_DELTA (default 1e-2)")
+    parser.add_argument("--expert-epochs", type=int, default=None,
+                        help="epochs of the clean expert AND of every retraining round (default %d)" % EPOCHS_EXPERT)
+    parser.add_argument("--expert-milestones", type=int, nargs="+", default=None,
+                        help="LR drop epochs of the expert/retraining rounds (default: MILESTONE's [75, 125], "
+                        "which never drops below 75 epochs); the user training is unchanged")
     parser.add_argument(
         "--split-batch-across-workers",
         action="store_true",
@@ -763,10 +857,32 @@ if __name__ == "__main__":
         WARP_S = args.warp_s
     if args.lr_warp is not None:
         LR_WARP = args.lr_warp
+    if args.photo_contrast is not None:
+        PHOTO_CONTRAST = args.photo_contrast
+    if args.photo_brightness is not None:
+        PHOTO_BRIGHTNESS = args.photo_brightness
+    if args.lr_photo is not None:
+        LR_PHOTO = args.lr_photo
+    if args.photo_local_grid is not None:
+        PHOTO_LOCAL_GRID = args.photo_local_grid
+    if args.photo_local_contrast is not None:
+        PHOTO_LOCAL_CONTRAST = args.photo_local_contrast
+    if args.photo_local_brightness is not None:
+        PHOTO_LOCAL_BRIGHTNESS = args.photo_local_brightness
+    if args.color_mix is not None:
+        COLOR_MIX = args.color_mix
+    if args.kernel_budget is not None:
+        KERNEL_BUDGET = args.kernel_budget
+    if args.lr_ext is not None:
+        LR_EXT = args.lr_ext
     if args.epsilon is not None:
         EPSILON = args.epsilon
     if args.lr_delta is not None:
         LR_DELTA = args.lr_delta
+    if args.expert_epochs is not None:
+        EPOCHS_EXPERT = EXPERT_RETRAIN_EPOCHS = args.expert_epochs
+    if args.expert_milestones is not None:
+        EXPERT_MILESTONES = args.expert_milestones
     if args.split_batch_across_workers:
         SPLIT_BATCH_ACROSS_WORKERS = True
     if args.lambda_bd is not None:

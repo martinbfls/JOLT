@@ -165,3 +165,8 @@ locks/
 
 # macOS
 .DS_Store
+
+# NFS executor state (orchestrate_student_machines/nfs_scheduler.py)
+nfs_state/
+# Datasets downloaded by modules/base_utils/datasets.py
+data/

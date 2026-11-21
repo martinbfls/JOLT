@@ -29,6 +29,11 @@
 #   TRIGGER_TYPE=hybrid EPSILON=0.0314 WARP_S=4.0 BUDGETS=1500 \
 #       SLURM_ACCOUNT=<account> ./orchestrate_slurm/run_warp_test_vs_multikrum_slurm.sh
 #
+# CHECKPOINT_TAG (default: unset): reuse the clean expert already trained under another tag
+# (out/checkpoints/<model>_1xs_<CHECKPOINT_TAG>/seed<SEED>) instead of training one for this cell.
+# The EXPERT job is then skipped and GEN starts right away; the expert does not depend on the
+# trigger, so cells sharing it stay comparable. Unset = one expert per VARIANT_TAG, as before.
+#
 # VARIANT_TAG (default: TRIGGER_TYPE) names this cell's experiments/out/checkpoints subtree AND
 # its Slurm job names -- override it (e.g. per sweep_warp_min_perturbation_slurm.sh cell) to run
 # several WARP_S/EPSILON/LAMBDA_LPIPS combos side by side without colliding on paths or job names.
@@ -65,6 +70,24 @@ EPSILON="${EPSILON:-}"
 # (split_batch_across_workers, see schemas/federated_train_user.toml). Changes every federated number.
 SPLIT_BATCH="${SPLIT_BATCH:-0}"
 LR_DELTA="${LR_DELTA:-}"
+CHECKPOINT_TAG="${CHECKPOINT_TAG:-}"
+# Photometric half of the hybrid trigger (per-channel contrast/brightness budgets, see
+# schemas/generate_labels_trigger_joint.toml); empty/0 = off.
+PHOTO_CONTRAST="${PHOTO_CONTRAST:-}"
+PHOTO_BRIGHTNESS="${PHOTO_BRIGHTNESS:-}"
+LR_PHOTO="${LR_PHOTO:-}"
+# Extra expressive transformations of the hybrid trigger (budgets; empty/0 = off): local contrast/brightness
+# grid, channel-mixing matrix, 3x3 kernel (see gen_configs.py --photo-local-* / --color-mix / --kernel-budget).
+PHOTO_LOCAL_CONTRAST="${PHOTO_LOCAL_CONTRAST:-}"
+PHOTO_LOCAL_BRIGHTNESS="${PHOTO_LOCAL_BRIGHTNESS:-}"
+PHOTO_LOCAL_GRID="${PHOTO_LOCAL_GRID:-}"
+COLOR_MIX="${COLOR_MIX:-}"
+KERNEL_BUDGET="${KERNEL_BUDGET:-}"
+LR_EXT="${LR_EXT:-}"
+# Clean expert and retraining rounds: epoch count and LR-drop epochs (space-separated, e.g.
+# EXPERT_MILESTONES="38 56"); empty = gen_configs.py's own (200 epochs, drops at 75/125).
+EXPERT_EPOCHS="${EXPERT_EPOCHS:-}"
+EXPERT_MILESTONES="${EXPERT_MILESTONES:-}"
 
 DEPLOY_NUM_POISONED="${DEPLOY_NUM_POISONED:-3}"
 DEPLOY_NUM_HONESTS="${DEPLOY_NUM_HONESTS:-7}"
@@ -82,6 +105,9 @@ FED_DEPLOY_REL="$CELL_REL/${DEPLOY_AGG_METHOD}_${DEPLOY_NUM_POISONED}vs${DEPLOY_
 
 echo "[PLAN] variant=$VARIANT_TAG trigger_type=$TRIGGER_TYPE warp_s=$WARP_S warp_k=$WARP_K lambda_bd=$LAMBDA_BD lambda_joint=$LAMBDA_JOINT lambda_lpips=$LAMBDA_LPIPS"
 echo "[PLAN] additive half: epsilon=${EPSILON:-<gen_configs default>} lr_delta=${LR_DELTA:-<gen_configs default>}"
+echo "[PLAN] photometric half: contrast=${PHOTO_CONTRAST:-0} brightness=${PHOTO_BRIGHTNESS:-0} lr_photo=${LR_PHOTO:-<default>}"
+echo "[PLAN] extra transformations: photo_local=${PHOTO_LOCAL_CONTRAST:-0}/${PHOTO_LOCAL_BRIGHTNESS:-0} color_mix=${COLOR_MIX:-0} kernel=${KERNEL_BUDGET:-0}"
+echo "[PLAN] expert: epochs=${EXPERT_EPOCHS:-<gen_configs default>} lr milestones=${EXPERT_MILESTONES:-<gen_configs default>}"
 echo "[PLAN] split_batch_across_workers=$SPLIT_BATCH (1 = same optimizer-step count as centralized)"
 echo "[PLAN] model=$MODEL_FLAG dataset=$DATASET seed=$SEED budgets=$BUDGETS_SINGLE"
 echo "[PLAN] centralized (1vs0, mean) vs federated ($DEPLOY_AGG_METHOD, ${DEPLOY_NUM_POISONED}vs${DEPLOY_NUM_HONESTS})"
@@ -111,12 +137,25 @@ GEN_ARGS=(--single-cell --trigger-type "$TRIGGER_TYPE" --exp-base-tag "$VARIANT_
 [ -n "$EPSILON" ] && GEN_ARGS+=(--epsilon "$EPSILON")
 [ "$SPLIT_BATCH" = "1" ] && GEN_ARGS+=(--split-batch-across-workers)
 [ -n "$LR_DELTA" ] && GEN_ARGS+=(--lr-delta "$LR_DELTA")
+[ -n "$CHECKPOINT_TAG" ] && GEN_ARGS+=(--checkpoint-tag "$CHECKPOINT_TAG")
+[ -n "$PHOTO_CONTRAST" ] && GEN_ARGS+=(--photo-contrast "$PHOTO_CONTRAST")
+[ -n "$PHOTO_BRIGHTNESS" ] && GEN_ARGS+=(--photo-brightness "$PHOTO_BRIGHTNESS")
+[ -n "$LR_PHOTO" ] && GEN_ARGS+=(--lr-photo "$LR_PHOTO")
+[ -n "$PHOTO_LOCAL_CONTRAST" ] && GEN_ARGS+=(--photo-local-contrast "$PHOTO_LOCAL_CONTRAST")
+[ -n "$PHOTO_LOCAL_BRIGHTNESS" ] && GEN_ARGS+=(--photo-local-brightness "$PHOTO_LOCAL_BRIGHTNESS")
+[ -n "$PHOTO_LOCAL_GRID" ] && GEN_ARGS+=(--photo-local-grid "$PHOTO_LOCAL_GRID")
+[ -n "$COLOR_MIX" ] && GEN_ARGS+=(--color-mix "$COLOR_MIX")
+[ -n "$KERNEL_BUDGET" ] && GEN_ARGS+=(--kernel-budget "$KERNEL_BUDGET")
+[ -n "$LR_EXT" ] && GEN_ARGS+=(--lr-ext "$LR_EXT")
+[ -n "$EXPERT_EPOCHS" ] && GEN_ARGS+=(--expert-epochs "$EXPERT_EPOCHS")
+# shellcheck disable=SC2206
+[ -n "$EXPERT_MILESTONES" ] && GEN_ARGS+=(--expert-milestones $EXPERT_MILESTONES)
 [ "$DRY_RUN" = "1" ] && GEN_ARGS+=(--dry-run)
 run_gen_configs_on_compute_node "${GEN_ARGS[@]}"
 
 MISSING=0
 for p in \
-    "$EXP_BASE_REL/train_expert/${MODEL_FLAG}_1xs_${VARIANT_TAG}/seed${SEED}" \
+    "$EXP_BASE_REL/train_expert/${MODEL_FLAG}_1xs_${CHECKPOINT_TAG:-$VARIANT_TAG}/seed${SEED}" \
     "$CELL_REL/gen_labels_trigger_joint" \
     "$CELL_REL/select_flips"; do
     [ -f "experiments/$p/config.toml" ] || { echo "[CONFIG] missing: experiments/$p/config.toml" >&2; MISSING=$((MISSING + 1)); }
@@ -140,15 +179,21 @@ preflight_slurm || exit 1
 # ---------------------------------------------------------------------------
 # Shared trunk: EXPERT -> GEN
 # ---------------------------------------------------------------------------
-EXPERT_JOBS=("python run_experiment.py $EXP_BASE_REL/train_expert/${MODEL_FLAG}_1xs_${VARIANT_TAG}/seed${SEED}|${VARIANT_TAG}_expert_${MODEL_FLAG}_seed${SEED}")
-TIME_PER_TASK="$EXPERT_TIME"
-submit_job_pool_slurm EXPERT_JOBS "${VARIANT_TAG}_expert" "" || exit 1
-expert_barrier=$(submit_barrier_slurm "${VARIANT_TAG}_barrier_expert" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
-echo "[PHASE] EXPERT submitted -> barrier $expert_barrier"
+if [ -n "$CHECKPOINT_TAG" ]; then
+    gen_dep=""
+    echo "[PHASE] EXPERT skipped: reusing out/checkpoints/${MODEL_FLAG}_1xs_${CHECKPOINT_TAG}/seed${SEED}"
+else
+    EXPERT_JOBS=("python run_experiment.py $EXP_BASE_REL/train_expert/${MODEL_FLAG}_1xs_${VARIANT_TAG}/seed${SEED}|${VARIANT_TAG}_expert_${MODEL_FLAG}_seed${SEED}")
+    TIME_PER_TASK="$EXPERT_TIME"
+    submit_job_pool_slurm EXPERT_JOBS "${VARIANT_TAG}_expert" "" || exit 1
+    expert_barrier=$(submit_barrier_slurm "${VARIANT_TAG}_barrier_expert" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
+    gen_dep="afterok:$expert_barrier"
+    echo "[PHASE] EXPERT submitted -> barrier $expert_barrier"
+fi
 
 GEN_JOBS=("python run_experiment.py $CELL_REL/gen_labels_trigger_joint|${VARIANT_TAG}_gen_${MODEL_FLAG}_${DATASET}_seed${SEED}")
 TIME_PER_TASK="$GEN_TIME"
-submit_job_pool_slurm GEN_JOBS "${VARIANT_TAG}_gen" "afterok:$expert_barrier" || exit 1
+submit_job_pool_slurm GEN_JOBS "${VARIANT_TAG}_gen" "$gen_dep" || exit 1
 gen_barrier=$(submit_barrier_slurm "${VARIANT_TAG}_barrier_gen" "afterok:$(join_job_ids "${SUBMITTED_JOB_IDS[@]}")") || exit 1
 echo "[PHASE] GEN submitted -> barrier $gen_barrier"
 
@@ -193,6 +238,7 @@ fed_gen_cmd+=" --trigger-type $TRIGGER_TYPE --exp-base-tag $VARIANT_TAG --model-
 fed_gen_cmd+=" --budgets '$BUDGETS_SINGLE' --deploy-num-poisoned $DEPLOY_NUM_POISONED"
 fed_gen_cmd+=" --deploy-num-honests $DEPLOY_NUM_HONESTS --deploy-agg-method $DEPLOY_AGG_METHOD"
 [ "$SPLIT_BATCH" = "1" ] && fed_gen_cmd+=" --split-batch-across-workers"
+[ -n "$CHECKPOINT_TAG" ] && fed_gen_cmd+=" --checkpoint-tag $CHECKPOINT_TAG"
 FED_GEN_JOBS=("$fed_gen_cmd|${VARIANT_TAG}_fed_gen_${MODEL_FLAG}_${DATASET}_seed${SEED}")
 TIME_PER_TASK="$GEN_CONFIGS_TIME"
 GPUS_PER_TASK=0 CPUS_PER_TASK=2 MEM_PER_TASK=4G submit_job_pool_slurm FED_GEN_JOBS "${VARIANT_TAG}_fed_gen" "afterok:$gen_barrier" || exit 1

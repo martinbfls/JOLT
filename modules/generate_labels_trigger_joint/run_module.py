@@ -5,7 +5,9 @@ The trigger is an additive perturbation, a WaNet-style warp, or both composed (t
 
 from pathlib import Path
 import math
+import os
 import random
+import shutil
 import sys
 import json
 import warnings
@@ -27,6 +29,7 @@ from modules.base_utils.util import (
     make_pbar,
     needs_big_ims,
     slurmify_path,
+    local_storage_path,
     clf_loss,
     clf_eval,
     softmax,
@@ -58,6 +61,7 @@ from modules.generate_labels_trigger_joint.utils import (
     TriggerMTTDataset,
     extract_experts_biased,
     build_expert_pool,
+    load_expert_pool,
     directional_floor_penalty,
     magnitude_floor_penalty,
     project_trigger_constraints,
@@ -68,6 +72,58 @@ from modules.generate_labels_trigger_joint.utils import (
     margin_floor_penalty,
     poison_consistency,
 )
+
+
+# Config keys whose change makes a resume snapshot unusable (different variables, shapes or
+# objective); any other difference is only reported. attack_config.iterations may change: that
+# is how a finished run is extended.
+_RESUME_STRICT_KEYS = (
+    "expert_model", "dataset", "source_label", "target_label", "trigger_type", "warp_k",
+    "photo_contrast", "photo_brightness", "photo_local_contrast", "photo_local_brightness",
+    "photo_local_grid", "color_mix", "kernel_budget", "num_honests", "num_poisoned", "agg_method", "attack",
+    "train_pct", "clean_trajectory",
+)
+
+
+def _check_resume_compatible(saved_args, args):
+    """Raises if the snapshot was written by an incompatible config, warns on other differences."""
+    strict = [k for k in _RESUME_STRICT_KEYS if saved_args.get(k) != args.get(k)]
+    if strict:
+        raise ValueError(
+            "resume_state_path holds a snapshot of an incompatible run (differs on "
+            + ", ".join(f"{k}: {saved_args.get(k)!r} -> {args.get(k)!r}" for k in strict)
+            + ") -- delete it to start over."
+        )
+
+    def _strip(a):
+        a = dict(a)
+        a["attack_config"] = {k: v for k, v in dict(a.get("attack_config", {})).items() if k != "iterations"}
+        return a
+
+    saved, cur = _strip(saved_args), _strip(args)
+    other = sorted(k for k in set(saved) | set(cur) if saved.get(k) != cur.get(k))
+    if other:
+        print(f"WARNING [resume]: config differs from the snapshot's on {other} -- resuming anyway.")
+
+
+def _rng_state():
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _set_rng_state(rng):
+    random.setstate(rng["python"])
+    np.random.set_state(rng["numpy"])
+    torch.set_rng_state(rng["torch"])
+    if rng["cuda"] is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(rng["cuda"])
+        except (RuntimeError, IndexError) as e:  # a different GPU count than the saving machine
+            print(f"WARNING [resume]: CUDA RNG state not restored ({e}).")
 
 
 def run(experiment_name, module_name, **kwargs):
@@ -107,8 +163,8 @@ def run(experiment_name, module_name, **kwargs):
         "trigger_alignment", ["cos_target", "cos_source", "cos_delta_to_init"], ylabel="Cosine similarity",
     )
 
-    input_pths = args["input_pths"]
-    opt_pths = args["opt_pths"]
+    input_pths = local_storage_path(args["input_pths"])
+    opt_pths = local_storage_path(args["opt_pths"])
     expert_model_flag = args["expert_model"]
     dataset_flag = args["dataset"]
     clean_label = args["source_label"]
@@ -170,6 +226,35 @@ def run(experiment_name, module_name, **kwargs):
     lr_delta = args.get("lr_delta", 1e-2)
     # the control grid lives in pixels, on a different scale than the additive delta in [0, 1]
     lr_warp = args.get("lr_warp", 1e-1)
+    # photometric half of the hybrid trigger: per-channel contrast (gain = 1 + a, |a| <= photo_contrast)
+    # and brightness (shift b, |b| <= photo_brightness), applied between the warp and the additive delta.
+    # Both budgets at 0 (default) = off, the trigger is then exactly the warp + additive one.
+    photo_contrast = args.get("photo_contrast", 0.0)
+    photo_brightness = args.get("photo_brightness", 0.0)
+    lr_photo = args.get("lr_photo", 1e-2)
+    has_photo = photo_contrast > 0 or photo_brightness > 0
+    if has_photo and not is_hybrid:
+        raise ValueError(
+            f"photo_contrast/photo_brightness need trigger_type='hybrid', got {trigger_type!r}"
+        )
+    # Extra expressive transformations (all hybrid-only, off at 0): each a deviation from the identity,
+    # box-bounded by its budget and optimized in the same Adam (lr_ext). Composition order and exact
+    # definitions: apply_trigger_raw / apply_kernel / apply_color_mix / apply_photo_local.
+    photo_local_grid = args.get("photo_local_grid", 4)
+    photo_local_contrast = args.get("photo_local_contrast", 0.0)
+    photo_local_brightness = args.get("photo_local_brightness", 0.0)
+    color_mix_budget = args.get("color_mix", 0.0)
+    kernel_budget = args.get("kernel_budget", 0.0)
+    lr_ext = args.get("lr_ext", 1e-2)
+    has_photo_local = photo_local_contrast > 0 or photo_local_brightness > 0
+    has_color_mix = color_mix_budget > 0
+    has_kernel = kernel_budget > 0
+    has_ext = has_photo_local or has_color_mix or has_kernel
+    if has_ext and not is_hybrid:
+        raise ValueError(
+            "photo_local_*/color_mix/kernel_budget need trigger_type='hybrid', "
+            f"got {trigger_type!r}"
+        )
     lambda_bd = args.get("lambda_bd", 1.0)
     lambda_joint = args.get("lambda_joint", 0.0)
     track_joint = lambda_joint != 0
@@ -265,6 +350,23 @@ def run(experiment_name, module_name, **kwargs):
         metrics_log_path = slurmify_path(metrics_log_path, slurm_id)
     history = [] if metrics_log_path else None
 
+    # Per-outer-iteration snapshot of the whole optimization (labels, trigger, both optimizers,
+    # RNGs, metric histories), overwritten after every iteration: a rerun of the same config
+    # resumes from it instead of starting over, and raising attack_config.iterations afterwards
+    # continues a finished run. Kept with the cell's outputs (not on the machine-local disk), so a
+    # resumed run may land on any machine. Unset = no snapshot, no resume.
+    resume_state_path = args.get("resume_state_path", None)
+    if resume_state_path is not None:
+        resume_state_path = Path(slurmify_path(resume_state_path, slurm_id))
+    resume_state = None
+    if resume_state_path is not None and resume_state_path.exists():
+        resume_state = torch.load(resume_state_path, map_location="cpu", weights_only=False)
+        _check_resume_compatible(resume_state["args"], args)
+        print(
+            f"[resume] {resume_state_path}: resuming at outer iteration {resume_state['next_it']}"
+            f"/{config['iterations']} (expert retraining round {resume_state['expert_retrain_round']})."
+        )
+
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     print("Building datasets...")
@@ -329,11 +431,13 @@ def run(experiment_name, module_name, **kwargs):
         )
     )
 
-    def apply_trigger(x_raw, d, cg):
-        """Preprocessed triggered images for the optimized variables: the additive delta `d` and
-        the warp control grid `cg` (each None when its component is off; see apply_trigger_raw)."""
+    def apply_trigger(x_raw, d, cg, ph=None, ex=None):
+        """Preprocessed triggered images for the optimized variables: the additive delta `d`, the
+        warp control grid `cg` and the photometric (2, C) tensor `ph` (each None when its component
+        is off; see apply_trigger_raw)."""
         return raw_to_trigger_preprocess(
             x_raw, d, dataset_flag=dataset_flag, model_flag=expert_model_flag, control_grid=cg, s=warp_s,
+            photo=ph, ext=ex,
         )
 
     def trigger_artifact():
@@ -349,9 +453,30 @@ def run(experiment_name, module_name, **kwargs):
         }
         if has_additive:
             artifact["delta"] = delta_add.detach().cpu()
+        if has_photo:
+            artifact["photo"] = photo.detach().cpu()
+            artifact["photo_contrast"] = photo_contrast
+            artifact["photo_brightness"] = photo_brightness
+        if has_ext:
+            artifact["ext"] = {k: v.detach().cpu() for k, v in ext.items()}
+            artifact["ext_budgets"] = {
+                "photo_local_contrast": photo_local_contrast, "photo_local_brightness": photo_local_brightness,
+                "color_mix": color_mix_budget, "kernel_budget": kernel_budget,
+            }
         return artifact
 
     warp_grid = init_warp_field(warp_k, warp_s, device=device) if has_warp else None
+    # (2, C): row 0 contrast deviation, row 1 brightness shift; starts at 0 = identity
+    photo = torch.zeros(2, mu.shape[0], device=device) if has_photo else None
+    # extra transformations, name -> leaf tensor, all 0 = identity (see apply_trigger_raw)
+    n_ch = mu.shape[0]
+    ext = {}
+    if has_kernel:
+        ext["kernel"] = torch.zeros(n_ch, 3, 3, device=device)
+    if has_color_mix:
+        ext["color_mix"] = torch.zeros(n_ch, n_ch, device=device)
+    if has_photo_local:
+        ext["photo_local"] = torch.zeros(2, n_ch, photo_local_grid, photo_local_grid, device=device)
     delta_add = (
         init_delta(
             mu.shape,
@@ -368,7 +493,8 @@ def run(experiment_name, module_name, **kwargs):
     # to -- the additive perturbation whenever there is one, the control grid under the warp-only
     # trigger (where it is the single optimized variable, as before this file knew about 'hybrid').
     delta = delta_add if has_additive else warp_grid
-    trigger_vars = [v for v in (delta_add, warp_grid) if v is not None]
+    trigger_vars = [v for v in (delta_add, warp_grid, photo) if v is not None] + list(ext.values())
+    warp_var_idx = next(i for i, v in enumerate(trigger_vars) if v is warp_grid) if has_warp else None
 
     def accumulate_trigger_grad(loss, weight, extra_targets=(), create_graph=False):
         """Adds weight * dloss/dv into every trigger variable's own .grad -- the manual,
@@ -408,9 +534,12 @@ def run(experiment_name, module_name, **kwargs):
     if is_hybrid:
         # one Adam over both components, each with its own learning rate (they live on different
         # scales: [0, 1] intensity for delta, pixels for the control grid)
-        optimizer_delta = torch.optim.Adam(
-            [{"params": [delta_add], "lr": lr_delta}, {"params": [warp_grid], "lr": lr_warp}]
-        )
+        param_groups = [{"params": [delta_add], "lr": lr_delta}, {"params": [warp_grid], "lr": lr_warp}]
+        if has_photo:
+            param_groups.append({"params": [photo], "lr": lr_photo})
+        if ext:
+            param_groups.append({"params": list(ext.values()), "lr": lr_ext})
+        optimizer_delta = torch.optim.Adam(param_groups)
     else:
         optimizer_delta = torch.optim.Adam([delta], lr=lr_warp if has_warp else lr_delta)
 
@@ -454,12 +583,19 @@ def run(experiment_name, module_name, **kwargs):
     delta_init = None
     delta_add_init = None
     warp_grid_init = None
+    photo_init = None
+    ext_init = None
     prev_delta_sign = None
 
     expert_pool = None
-    if pool_size != 1:
+    pool_paths = None
+    if pool_size != 1 and resume_state is None:
         print(f"Preloading up to {pool_size} expert checkpoints into RAM (float32, CPU)...")
-        expert_pool, pool_size = build_expert_pool(expert_starts, expert_opt_starts, pool_size)
+        expert_pool, pool_size, pool_paths = build_expert_pool(expert_starts, expert_opt_starts, pool_size)
+    elif resume_state is not None:
+        # the pool is restored (or rebuilt by a retraining round) below, with the rest of the state
+        pool_size = resume_state["pool_size"]
+        n_checkpoints_per_step = resume_state["n_checkpoints_per_step"]
 
     if n_checkpoints_per_step > pool_size:
         raise ValueError(
@@ -501,16 +637,37 @@ def run(experiment_name, module_name, **kwargs):
         drawn = random.sample(expert_pool, n_checkpoints_per_step)
         return [(checkpoint, _opt_state_to_device(opt_state_cpu, device)) for checkpoint, opt_state_cpu in drawn]
 
-    retrain_base_dir = Path(output_dir).parent / "expert_retrain"
+    # Read back only by this run, so machine-local under the NFS executor (no-op otherwise).
+    # Every round OVERWRITES the previous one's trajectory (expert index 0, like train_expert's
+    # own layout): only the latest round is ever read back -- its pool is loaded into RAM right
+    # after it is written -- and a 200-epoch trajectory is ~3 GB. The marker names the round the
+    # directory holds once complete; it is removed before a round starts overwriting it.
+    retrain_base_dir = Path(local_storage_path(Path(output_dir).parent / "expert_retrain"))
+    retrain_dir = retrain_base_dir / "0"
+    retrain_marker = retrain_base_dir / "complete_round.txt"
+    retrain_input_pths = str(retrain_base_dir / "{}" / "model_{}_{}.pth")
+    retrain_opt_pths = str(retrain_base_dir / "{}" / "model_{}_{}_opt.pth")
+
+    def _retrained_round_on_disk():
+        """Round whose complete trajectory retrain_dir holds, or None."""
+        try:
+            return int(retrain_marker.read_text().strip())
+        except (OSError, ValueError):
+            return None
 
     def _retrain_expert_with_trigger(round_idx, it, remaining_iterations):
-        nonlocal expert_starts, expert_opt_starts, expert_pool, pool_size, n_checkpoints_per_step
+        nonlocal expert_starts, expert_opt_starts, expert_pool, pool_size, n_checkpoints_per_step, pool_paths
 
         norms = []
         if has_additive:
             norms.append(f"||delta||_inf={delta_add.abs().max().item():.4f}")
         if has_warp:
             norms.append(f"||control_grid||_inf={warp_grid.abs().max().item():.4f}")
+        if has_photo:
+            norms.append(f"|contrast|_max={photo[0].abs().max().item():.4f}, "
+                         f"|brightness|_max={photo[1].abs().max().item():.4f}")
+        for name_, v_ in ext.items():
+            norms.append(f"|{name_}|_max={v_.abs().max().item():.4f}")
         print(
             f"[expert_retrain] round {round_idx}: retraining a fresh expert for "
             f"{expert_retrain_epochs} epochs against the CURRENT trigger ({', '.join(norms)})..."
@@ -555,7 +712,8 @@ def run(experiment_name, module_name, **kwargs):
             optim_kwargs=expert_retrain_optim_kwargs,
             scheduler_kwargs=expert_retrain_scheduler_kwargs,
         )
-        round_dir = retrain_base_dir / f"round{round_idx}" / "0"
+        retrain_marker.unlink(missing_ok=True)
+        shutil.rmtree(retrain_dir, ignore_errors=True)
         # No per-epoch test_data: mini_train would only print it (record=False, result unused).
         mini_train(
             model=retrain_model,
@@ -570,17 +728,17 @@ def run(experiment_name, module_name, **kwargs):
                 e,
                 i,
                 expert_retrain_checkpoint_iters,
-                str(round_dir),
+                str(retrain_dir),
             ),
         )
+        retrain_marker.write_text(f"{round_idx}\n")
 
         retrain_cta = clf_eval(retrain_model, test)[0]
         retrain_asr = clf_eval(retrain_model, poison_test.poison_dataset)[0]
         print(f"[expert_retrain] round {round_idx}: retrained expert CTA={retrain_cta:.4f} ASR={retrain_asr:.4f}")
         tracker.log(global_step, retrain_expert_cta=retrain_cta, retrain_expert_asr=retrain_asr)
 
-        round_input_pths = str(retrain_base_dir / f"round{round_idx}" / "{}" / "model_{}_{}.pth")
-        round_opt_pths = str(retrain_base_dir / f"round{round_idx}" / "{}" / "model_{}_{}_opt.pth")
+        round_input_pths, round_opt_pths = retrain_input_pths, retrain_opt_pths
         extract_iterations = max(remaining_iterations, pool_size) if pool_size != 1 else remaining_iterations
         if checkpoint_sampling == "uniform":
             new_starts, new_opt_starts = extract_experts(
@@ -605,7 +763,7 @@ def run(experiment_name, module_name, **kwargs):
                 f"[expert_retrain] round {round_idx}: refreshing the {pool_size}-checkpoint "
                 "pool from the retrained trajectory..."
             )
-            expert_pool, pool_size = build_expert_pool(
+            expert_pool, pool_size, pool_paths = build_expert_pool(
                 new_starts,
                 new_opt_starts,
                 pool_size,
@@ -627,10 +785,120 @@ def run(experiment_name, module_name, **kwargs):
     mag_active_window = []
     ANTI_COLLAPSE_WINDOW = 50
     global_step = 0
+    start_it = 0
+    expert_retrain_round = 0
 
-    with make_pbar(total=config["iterations"] * len(mtt_dataset)) as pbar:
-        expert_retrain_round = 0
-        for it in range(config["iterations"]):
+    def _cpu(t):
+        return None if t is None else t.detach().cpu().clone()
+
+    def _save_resume_state(next_it):
+        """Snapshot after outer iteration next_it-1 (atomic overwrite), plus that iteration's trigger."""
+        if resume_state_path is None:
+            return
+        state = {
+            "version": 1,
+            "args": json.loads(json.dumps(args)),  # plain dicts: toml's inline tables don't pickle
+            "next_it": next_it,
+            "expert_retrain_round": expert_retrain_round,
+            "global_step": global_step,
+            "labels_syn": _cpu(labels_syn),
+            "optimizer_labels": optimizer_labels.state_dict(),
+            "trigger": {"delta_add": _cpu(delta_add), "warp_grid": _cpu(warp_grid), "photo": _cpu(photo)},
+            "ext": {k: _cpu(v) for k, v in ext.items()},
+            "ext_init": None if ext_init is None else {k: _cpu(v) for k, v in ext_init.items()},
+            "optimizer_delta": optimizer_delta.state_dict(),
+            "trigger_init": {
+                "delta_add": _cpu(delta_add_init), "warp_grid": _cpu(warp_grid_init), "photo": _cpu(photo_init),
+            },
+            "prev_delta_sign": _cpu(prev_delta_sign),
+            "align_active_window": align_active_window,
+            "mag_active_window": mag_active_window,
+            "losses": losses,
+            "history": history,
+            "tracker_history": tracker._history,
+            "lambdas": {
+                "lambda_bd": lambda_bd, "lambda_gradmatch": lambda_gradmatch,
+                "lambda_lpips": lambda_lpips, "lambda_consistency": lambda_consistency,
+            },
+            "pool_size": pool_size,
+            "n_checkpoints_per_step": n_checkpoints_per_step,
+            "pool_paths": pool_paths,
+            "expert_starts": expert_starts,
+            "expert_opt_starts": expert_opt_starts,
+            "rng": _rng_state(),
+        }
+        resume_state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = resume_state_path.with_name(resume_state_path.name + ".tmp")
+        torch.save(state, tmp)
+        os.replace(tmp, resume_state_path)
+        torch.save(trigger_artifact(), resume_state_path.parent / f"trigger_it{next_it:03d}.pt")
+        print(f"[resume] state saved after outer iteration {next_it}/{config['iterations']} -> {resume_state_path}")
+
+    if resume_state is not None:
+        st = resume_state
+        with torch.no_grad():
+            labels_syn.copy_(st["labels_syn"])
+            for name, v in (("delta_add", delta_add), ("warp_grid", warp_grid), ("photo", photo)):
+                if v is not None:
+                    v.copy_(st["trigger"][name].to(v.device))
+        # load_state_dict also restores the saved hyperparameters (lr, ...): keep the config's.
+        for opt, saved in ((optimizer_labels, st["optimizer_labels"]), (optimizer_delta, st["optimizer_delta"])):
+            hyper = [{k: v for k, v in g.items() if k != "params"} for g in opt.param_groups]
+            opt.load_state_dict(saved)
+            for g, h in zip(opt.param_groups, hyper):
+                g.update(h)
+
+        def _dev(t):
+            return None if t is None else t.to(device)
+
+        delta_add_init = _dev(st["trigger_init"]["delta_add"])
+        warp_grid_init = _dev(st["trigger_init"]["warp_grid"])
+        photo_init = _dev(st["trigger_init"]["photo"])
+        for k_, v_ in ext.items():
+            with torch.no_grad():
+                v_.copy_(st["ext"][k_].to(v_.device))
+        ext_init = None if st.get("ext_init") is None else {k_: _dev(v_) for k_, v_ in st["ext_init"].items()}
+        delta_init = delta_add_init if has_additive else warp_grid_init
+        prev_delta_sign = _dev(st["prev_delta_sign"])
+        align_active_window = st["align_active_window"]
+        mag_active_window = st["mag_active_window"]
+        losses = st["losses"]
+        if history is not None and st["history"] is not None:
+            history = st["history"]
+        tracker._history = st["tracker_history"]
+        lambda_bd = st["lambdas"]["lambda_bd"]
+        lambda_gradmatch = st["lambdas"]["lambda_gradmatch"]
+        lambda_lpips = st["lambdas"]["lambda_lpips"]
+        lambda_consistency = st["lambdas"]["lambda_consistency"]
+        global_step = st["global_step"]
+        start_it = st["next_it"]
+        expert_retrain_round = st["expert_retrain_round"]
+        expert_starts, expert_opt_starts = st["expert_starts"], st["expert_opt_starts"]
+        pool_paths = st["pool_paths"]
+
+        # The next iteration needs the pool unless it starts with a retraining round of its own.
+        retrains_first = bool(expert_retrain_interval) and start_it > 0 and start_it % expert_retrain_interval == 0
+        if pool_size != 1 and start_it < config["iterations"] and not retrains_first:
+            on_disk = expert_retrain_round == 0 or _retrained_round_on_disk() == expert_retrain_round
+            if on_disk and all(os.path.exists(p) and os.path.exists(o) for p, o in pool_paths):
+                print(f"[resume] reloading the {len(pool_paths)}-checkpoint pool...")
+                expert_pool = load_expert_pool(pool_paths)
+            elif expert_retrain_round > 0:
+                print(
+                    f"[resume] round {expert_retrain_round}'s retrained trajectory is not on this "
+                    "machine -- retraining it against the restored trigger."
+                )
+                _retrain_expert_with_trigger(expert_retrain_round, start_it, config["iterations"] - start_it)
+            else:
+                missing = [p for p, o in pool_paths if not (os.path.exists(p) and os.path.exists(o))]
+                raise FileNotFoundError(f"[resume] initial expert checkpoints missing, e.g. {missing[:3]}")
+        _set_rng_state(st["rng"])
+
+    with make_pbar(
+        total=config["iterations"] * len(mtt_dataset),
+        initial=min(start_it, config["iterations"]) * len(mtt_dataset),
+    ) as pbar:
+        for it in range(start_it, config["iterations"]):
             if expert_retrain_interval and it > 0 and it % expert_retrain_interval == 0:
                 expert_retrain_round += 1
                 _retrain_expert_with_trigger(
@@ -720,7 +988,7 @@ def run(experiment_name, module_name, **kwargs):
                             if is_poisoned.any():
                                 idx_poisoned = idx[is_poisoned].tolist()
                                 x_raw_adv = _raw_poison_batch(idx_poisoned)
-                                x_trig = apply_trigger(x_raw_adv, delta_add, warp_grid)
+                                x_trig = apply_trigger(x_raw_adv, delta_add, warp_grid, photo, ext)
                                 x_t_adv = x_t.clone()
 
                                 x_t_adv[is_poisoned_dev] = x_trig
@@ -786,7 +1054,7 @@ def run(experiment_name, module_name, **kwargs):
                                 if lpips_model is not None:
                                     L_lpips_cid = lpips_penalty(
                                         x_raw_adv, lpips_model, delta=delta_add,
-                                        control_grid=warp_grid, warp_s=warp_s,
+                                        control_grid=warp_grid, warp_s=warp_s, photo=photo, ext=ext,
                                     )
                                     accumulate_trigger_grad(
                                         L_lpips_cid, lambda_lpips / n_checkpoints_per_step,
@@ -963,7 +1231,7 @@ def run(experiment_name, module_name, **kwargs):
                     for v, g_manual in zip(trigger_vars, manual_only_grads)
                 ]
                 mtt_delta_grad_norm = mtt_trigger_grad_norms[0]
-                mtt_warp_grad_norm = mtt_trigger_grad_norms[-1] if has_warp else 0.0
+                mtt_warp_grad_norm = mtt_trigger_grad_norms[warp_var_idx] if has_warp else 0.0
 
                 optimizer_labels.step()
                 optimizer_delta.step()
@@ -976,6 +1244,16 @@ def run(experiment_name, module_name, **kwargs):
                             delta.clamp_(-epsilon, epsilon)
                     if has_warp:
                         warp_grid.clamp_(-warp_s, warp_s)
+                    if has_photo:
+                        photo[0].clamp_(-photo_contrast, photo_contrast)
+                        photo[1].clamp_(-photo_brightness, photo_brightness)
+                    if "kernel" in ext:
+                        ext["kernel"].clamp_(-kernel_budget, kernel_budget)
+                    if "color_mix" in ext:
+                        ext["color_mix"].clamp_(-color_mix_budget, color_mix_budget)
+                    if "photo_local" in ext:
+                        ext["photo_local"][0].clamp_(-photo_local_contrast, photo_local_contrast)
+                        ext["photo_local"][1].clamp_(-photo_local_brightness, photo_local_brightness)
 
                 for m in expert_models:
                     m.eval()
@@ -1010,6 +1288,8 @@ def run(experiment_name, module_name, **kwargs):
                     if just_captured:
                         delta_add_init = delta_add.detach().clone() if has_additive else None
                         warp_grid_init = warp_grid.detach().clone() if has_warp else None
+                        photo_init = photo.detach().clone() if has_photo else None
+                        ext_init = {k_: v_.detach().clone() for k_, v_ in ext.items()} if ext else None
                         delta_init = delta_add_init if has_additive else warp_grid_init
                     cos_to_init = cosine_to(delta, delta_init).item()
                     delta_drift_l2 = (delta - delta_init).norm().item()
@@ -1019,8 +1299,8 @@ def run(experiment_name, module_name, **kwargs):
                             f"delta_drift_l2={delta_drift_l2} -- expected exactly 1.0/0.0."
                         )
 
-                    x_trig_eval = apply_trigger(asr_eval_raw, delta_add, warp_grid)
-                    x_trig_eval_frozen = apply_trigger(asr_eval_raw, delta_add_init, warp_grid_init)
+                    x_trig_eval = apply_trigger(asr_eval_raw, delta_add, warp_grid, photo, ext)
+                    x_trig_eval_frozen = apply_trigger(asr_eval_raw, delta_add_init, warp_grid_init, photo_init, ext_init)
                     asr_mean_list = [
                         (m(x_trig_eval).argmax(dim=1) == target_label).float().mean().item() for m in expert_models
                     ]
@@ -1080,6 +1360,11 @@ def run(experiment_name, module_name, **kwargs):
                     "lambda_lpips_current": lambda_lpips,
                     "lambda_consistency_current": lambda_consistency,
                 }
+                if has_photo:
+                    step_metrics["photo_contrast_abs"] = photo[0].abs().max().item()
+                    step_metrics["photo_brightness_abs"] = photo[1].abs().max().item()
+                for name_, v_ in ext.items():
+                    step_metrics[f"{name_}_abs"] = v_.abs().max().item()
                 if history is not None:
                     history.append({"it": it, **step_metrics})
                 tracker.log(global_step, **step_metrics)
@@ -1107,7 +1392,14 @@ def run(experiment_name, module_name, **kwargs):
                 if is_hybrid:  # the warp half, alongside delta_linf/mtt_grad for the additive one
                     postfix["warp_linf"] = f"{warp_linf:.4g}"
                     postfix["mtt_warp_grad"] = f"{mtt_warp_grad_norm:.4g}"
+                if has_photo:
+                    postfix["photo_c"] = f"{photo[0].abs().max().item():.3g}"
+                    postfix["photo_b"] = f"{photo[1].abs().max().item():.3g}"
+                for name_, v_ in ext.items():
+                    postfix[name_] = f"{v_.abs().max().item():.3g}"
                 pbar.set_postfix(**postfix)
+
+            _save_resume_state(it + 1)
 
     # Save results
     print("Saving results...")

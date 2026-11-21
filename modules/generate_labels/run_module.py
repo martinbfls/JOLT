@@ -12,7 +12,7 @@ from modules.base_utils.datasets import get_matching_datasets, pick_poisoner, ge
 from modules.base_utils.util import extract_toml, get_module_device, get_mtt_attack_info,\
                                     load_model, either_dataloader_dataset_to_both, make_pbar,\
                                     needs_big_ims, slurmify_path, clf_loss, softmax,\
-                                    total_mse_distance
+                                    total_mse_distance, local_storage_path
 from modules.generate_labels.utils import coalesce_attack_config, extract_experts,\
                                           extract_labels, sgd_step
 from modules.base_utils.experiment_tracker import ExperimentTracker
@@ -32,8 +32,8 @@ def run(experiment_name, module_name, **kwargs):
     args = extract_toml(experiment_name, module_name)
     tracker = ExperimentTracker(experiment_name, module_name, args, slurm_id=slurm_id, x_label="Optimization step")
 
-    input_pths = args["input_pths"]
-    opt_pths = args["opt_pths"]
+    input_pths = local_storage_path(args["input_pths"])
+    opt_pths = local_storage_path(args["opt_pths"])
     expert_model_flag = args["expert_model"]
     dataset_flag = args["dataset"]
     poisoner_flag = args["poisoner"]
